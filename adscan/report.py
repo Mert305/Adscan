@@ -170,6 +170,7 @@ def render_finding(f, *, color: bool, index: int | None = None) -> str:
     if f.mitre:
         meta += "   " + _paint(_DIM, "MITRE", color) + f" {f.mitre}"
     blocks.append(meta)
+    blocks.append(f"Doğrulama: {f.verification} · gözlem: {f.observed_at}")
 
     if f.description:
         blocks.append(f.description)
@@ -282,6 +283,10 @@ def print_recap(report: ScanReport, *, saved: list[str] | None = None) -> None:
 
     # --- yönetici özeti: risk puanı + en kritik bulgular ---
     print(_risk_banner(report, color))
+    print(f"  {report.assessment_label()} · {report.scan_mode}")
+    for c in report.coverage:
+        if c["status"] not in {"completed", "findings"}:
+            print(f"  [{c['status']}] {c['control_id']}: {c['reason']}")
     print()
 
     # --- başlık + hedef/DC kutusu ---
@@ -404,6 +409,14 @@ def write_markdown(report: ScanReport, path: str) -> None:
     lines.append(f"# AD Tarama Raporu — {report.target}")
     lines.append("")
     lines.append(f"*Oluşturulma:* {datetime.now():%Y-%m-%d %H:%M:%S}")
+    lines.append(f"\n**Değerlendirme:** {report.assessment_label()}")
+    lines.append(f"\n**Tarama modu:** {report.scan_mode}")
+    lines.extend(["", "## Kontrol Kapsamı", "",
+                  "| Kontrol | Durum | Açıklama |", "|---|---|---|"])
+    for c in report.coverage:
+        cells = [str(c[k]).replace("|", "\\|").replace("\n", " ")
+                 for k in ("control_id", "status", "reason")]
+        lines.append("| " + " | ".join(cells) + " |")
     lines.append("")
 
     counts = report.count_by_severity()
@@ -435,6 +448,11 @@ def write_markdown(report: ScanReport, path: str) -> None:
         lines.append("")
         lines.append(f"- **Kaynak:** {f.source}")
         lines.append(f"- **Hedef:** {f.target}")
+        lines.append(f"- **Doğrulama:** {f.verification}")
+        lines.append(f"- **Bulgu kimliği:** {f.fingerprint}")
+        lines.append(f"- **Nesne kimliği:** {f.object_id or 'toplanmadı'}")
+        lines.append(f"- **Gözlem zamanı:** {f.observed_at}")
+        lines.append(f"- **Araç sürümü:** {f.tool_version}")
         if f.reference:
             lines.append(f"- **Referans:** {f.reference}")
         if f.mitre:
@@ -566,6 +584,8 @@ def write_html(report: ScanReport, path: str) -> None:
             <span class="src">{_esc(f.source)}</span></summary>
           <div class="body">
             {f'<div class="kv"><b>Hedef:</b> {_esc(f.target)}</div>'}
+            <div class="kv"><b>Doğrulama:</b> {_esc(f.verification)} · {_esc(f.observed_at)}</div>
+            <div class="kv"><b>Bulgu kimliği:</b> {_esc(f.fingerprint)}</div>
             {f'<div class="kv"><b>Referans:</b> {_esc(f.reference)}</div>' if f.reference else ''}
             {mitre_txt}
             {f'<div class="kv"><b>Açıklama:</b> {_esc(f.description)}</div>' if f.description else ''}
@@ -649,6 +669,11 @@ def write_html(report: ScanReport, path: str) -> None:
   <h2>Saldırı Yolu</h2>
   <div class="chain">{chain_txt}</div>
 
+  <h2>Kontrol Kapsamı</h2>
+  <p>{_esc(report.assessment_label())} · {_esc(report.scan_mode)}</p>
+  <table><thead><tr><th>Kontrol</th><th>Durum</th><th>Açıklama</th></tr></thead><tbody>
+  {''.join('<tr>' + ''.join('<td>' + _esc(str(c[k])) + '</td>' for k in ('control_id', 'status', 'reason')) + '</tr>' for c in report.coverage)}
+  </tbody></table>
   <h2>Bulgular ({len(report.findings)})</h2>
   {''.join(rows) or '<p>Bulgu yok.</p>'}
   {creds_rows}

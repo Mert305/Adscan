@@ -18,10 +18,15 @@ python -m adscan 10.10.10.5 --auto -u user -p 'Pw!' -d corp.local   # otonom -> 
 python -m adscan --check                            # araçlar kurulu mu?
 ```
 
-- **`--full`** — tek komutla **maksimum kapsam**: tüm tespit modüllerini açar
+- **`--full`** — tek komutla **kimliğe göre kapsam**: uygun tespit modüllerini seçer
   (ADCS + bloodyAD + BloodHound + MSSQL + WinRM) ve paylaşılabilir HTML üretir.
-  Kimlik verilirse kimlikli modüller de çalışır; aktif ağ saldırıları yine ayrı
-  bayrak + onay ister.
+  Kimlik yoksa kimliksiz akış çalışır; kimlik gerektiren modüller ve Kerberoasting,
+  MAQ, pre2k, noPac, SCCM gibi kimlikli alt kontroller çağrılmaz, raporda atlandı
+  olarak gösterilir. Kimlik varsa desteklenen kimlikli modüller de seçilir.
+  Yalnızca kullanıcı adı yeterli değildir; parola, hash veya desteklenen Kerberos
+  akışı gerekir. Aktif ağ saldırıları yine ayrı bayrak + onay ister.
+  `--full` otomatik parola kırmaz; bunun için ayrıca `--crack` gerekir.
+  `--only` ve `--quiet` kapsamı daraltabilir. Bu mod salt okunurluk garantisi değildir.
 - **`--auto`** — otonom zincir: enum → kullanıcı çıkar → spray (kilitlenme-farkında)
   → ACL kısa-yol → Domain Admin yükseltme.
 - **`--cleanup <manifest>`** — iz bırakma: aktif akışlar ortamda yaptığı her
@@ -38,7 +43,7 @@ python -m adscan --check                            # araçlar kurulu mu?
   **Çevrimdışı kırma** (`--crack`): harvest edilen `$krb5tgs$`/`$krb5asrep$`
   hash'lerini hashcat (etype'a göre RC4 `-m 13100` / AES `-m 19600`·`19700`,
   AS-REP `-m 18200`) ya da john ile kırar; kırılan parolayı zincire kimlik olarak
-  besler. `--auto`/`--full` otomatik kırar.
+  besler. `--auto` otomatik kırar; `--full` için açıkça `--crack` gerekir.
 - **Delegasyon**: unconstrained, **constrained (S4U)**, **RBCD** (`--find-delegation`).
 - **Ayrıcalık/hijyen**: **adminCount=1 / adminSDHolder** artığı hesaplar, AD
   **`description` alanında saklanan parolalar** (get-desc-users), parola
@@ -102,6 +107,31 @@ Her tarama, paylaşılabilir ve makine-okunur çıktılar üretir:
 - **`--redact`** — parola/hash değerlerini çıktıda ve raporda maskeler.
 - **`--resume` / `--diff`** — önceki taramayla delta.
 - Spray **kilitlenme-farkındadır**; aktif saldırılar çift onay ister.
+
+## Kanıt ve kontrol kapsamı
+
+JSON, HTML ve Markdown raporları kontrol kapsamını içerir. `completed` yalnızca
+araç çalışmasının tamamlandığını gösterir; zafiyet yokluğu veya bütün AD'nin
+kontrol edildiği anlamına gelmez. `skipped`, `access_denied`, `failed`, `unknown`
+ve dry-run için `planned` durumları değerlendirmeyi eksik bırakır. Sıfır bulguya
+artık `TEMİZ` etiketi verilmez.
+
+Bulgularda sabit parmak izi, kontrol kimliği, gözlem zamanı, nesne kimliği
+(toplanmışsa), araç sürümü (biliniyorsa) ve doğrulama durumu bulunur. Eski
+ayrıştırıcılar `unverified`, nesneye bağlı Certipy bulguları `tool_reported`
+durumundadır; bunlar bağımsız istismar doğrulaması değildir. Aynı kaynaktan aynı
+nesne ve kanıtla gelen tekrarlar tekilleştirilir. Önceki raporda olup yeni raporda
+görülmeyen bulgu otomatik olarak çözülmüş sayılmaz.
+
+```bash
+python -m adscan 192.0.2.10 --full                         # kimliksiz kapsam
+python -m adscan 192.0.2.10 --full -u auditor --ask-pass -d lab.example
+python -m adscan 192.0.2.10 --full --dry-run               # çalıştırmadan plan
+```
+
+Bu geliştirmeler sıfır false positive veya veri sızdırmama garantisi vermez.
+Maskeleme hâlâ `--redact` ile açılır; şifreli kanıt deposu ve ağ çıkışı kısıtlaması
+bu sürümde eklenmemiştir.
 
 Bağımlılık yok (yalnızca Python 3.10+ standart kütüphanesi); harici CLI araçları
 PATH'te olmalıdır. `python -m adscan --guide` ile adım adım metodoloji.

@@ -62,4 +62,4 @@ def test_dry_run_through_registry():
             continue
         results = m.run(ctx)
         assert isinstance(results, list)
-        assert all(r.ok for r in results)
+        assert all(r.ok or r.error_kind == "skipped" for r in results)

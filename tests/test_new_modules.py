@@ -76,11 +76,12 @@ def test_bloodhound_reports_collected(tmp_path):
 
 # --- certipy (boşluk dolduruldu) ---
 
-def test_certipy_esc_is_critical(report):
-    out = ("Certipy v4\n[*] Vulnerabilities\n  ESC1: 'CORP\\Domain Users' can enroll\n"
-           "Template Name    : VulnTemplate")
+def test_certipy_esc_is_tool_reported(report):
+    out = ("Certipy v4\nTemplate Name : VulnTemplate\n"
+           "[*] Vulnerabilities\n  ESC1: 'CORP\\Domain Users' can enroll")
     certipy_scan.parse([cr(out, tool="certipy-find")], report)
-    assert severity_of(report, "ADCS savunmasız") == Severity.CRITICAL
+    assert severity_of(report, "ADCS savunmasız") == Severity.HIGH
+    assert report.findings[0].verification == "tool_reported"
 
 
 def test_certipy_skip_without_creds(report):
@@ -89,14 +90,15 @@ def test_certipy_skip_without_creds(report):
     assert report.findings == []
 
 
-def test_certipy_fills_real_ca_and_template_in_poc(report):
+def test_certipy_binds_evidence_to_template(report):
     out = ("Certificate Authorities\n  0\n    CA Name  : corp-DC01-CA\n"
            "Certificate Templates\n  0\n    Template Name   : UserCert\n"
            "    [!] Vulnerabilities\n      ESC1 : 'CORP\\Domain Users' can enroll")
     certipy_scan.parse([cr(out, tool="certipy-find")], report)
-    esc = next(f.escalation for f in report.findings if "ADCS savunmasız" in f.title)
-    assert "corp-DC01-CA" in esc and "UserCert" in esc        # gerçek CA + şablon
-    assert "<CA-ADI>" not in esc and "<SAVUNMASIZ-TPL>" not in esc  # placeholder kalmadı
+    finding = next(f for f in report.findings if "ADCS savunmasız" in f.title)
+    assert finding.object_id == "Template Name:UserCert"
+    assert "UserCert" in finding.evidence
+    assert "corp-DC01-CA" not in finding.evidence  # association was not supplied
 
 
 def test_certipy_ldaps_retry_on_ssl_error():

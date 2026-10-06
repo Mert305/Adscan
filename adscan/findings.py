@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import IntEnum
 
 
@@ -79,6 +81,22 @@ class Finding:
     poc: str = ""  # kullanıcının bulguyu DOĞRULAYABİLECEĞİ komut
     escalation: str = ""  # bu bulgudan ne çıkabilir / nasıl yükseltilir
     mitre: str = ""  # MITRE ATT&CK teknik id(leri), ör. "T1558.003"
+    control_id: str = ""
+    object_id: str = ""  # SID/GUID/DN when supplied by the collector; never inferred
+    verification: str = "unverified"
+    observed_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    tool_version: str = "unknown"
+
+    def __post_init__(self) -> None:
+        if not self.control_id:
+            # Legacy parsers have no rule IDs yet; keep this fallback explicit.
+            self.control_id = self.source + ":legacy:" + hashlib.sha256(
+                self.title.encode()).hexdigest()[:12]
+
+    @property
+    def fingerprint(self) -> str:
+        identity = (self.control_id or self.title, self.target.lower(), self.object_id)
+        return hashlib.sha256(repr(identity).encode()).hexdigest()[:24]
 
     def to_dict(self) -> dict:
         return {
@@ -93,6 +111,12 @@ class Finding:
             "poc": self.poc,
             "escalation": self.escalation,
             "mitre": self.mitre,
+            "fingerprint": self.fingerprint,
+            "control_id": self.control_id,
+            "object_id": self.object_id,
+            "verification": self.verification,
+            "observed_at": self.observed_at,
+            "tool_version": self.tool_version,
         }
 
 
@@ -113,9 +137,29 @@ class ScanReport:
     outdir: str = "adscan-reports"  # loot/çıktı klasörü (bloodhound vb. konumları için)
     da_members: list[str] = field(default_factory=list)  # Domain Admins üye adları (korelasyon)
     sessions: dict = field(default_factory=dict)  # host -> [oturum açmış kullanıcılar] (korelasyon)
+    coverage: list[dict] = field(default_factory=list)
+    scan_mode: str = "unspecified"
 
     def add(self, finding: Finding) -> None:
+        # Only collapse identical observations, never different evidence or objects.
+        if any(f.fingerprint == finding.fingerprint and f.source == finding.source
+               and f.evidence == finding.evidence and f.verification == finding.verification
+               and f.severity == finding.severity for f in self.findings):
+            return
         self.findings.append(finding)
+
+    def record_coverage(self, control_id: str, status: str, reason: str = "",
+                        *, module: str = "") -> None:
+        self.coverage.append({"control_id": control_id, "module": module or control_id,
+                              "target": self.target, "status": status, "reason": reason})
+
+    @property
+    def assessment_complete(self) -> bool:
+        return bool(self.coverage) and not self.errors and all(
+            c["status"] in {"completed", "findings", "not_applicable"} for c in self.coverage)
+
+    def assessment_label(self) -> str:
+        return "Seçilen kontroller tamamlandı" if self.assessment_complete else "Değerlendirme eksik"
 
     def add_error(self, msg: str) -> None:
         self.errors.append(msg)
@@ -169,7 +213,7 @@ class ScanReport:
             return "ORTA"
         if s > 0:
             return "DÜŞÜK"
-        return "TEMİZ"
+        return "BULGU YOK" if self.assessment_complete else "DEĞERLENDİRME EKSİK"
 
     def top_findings(self, n: int = 3) -> list[Finding]:
         """En kritik n bulgu (yönetici özeti/rapor başı için)."""
@@ -218,6 +262,10 @@ class ScanReport:
     def to_dict(self) -> dict:
         return {
             "target": self.target,
+            "schema_version": 2,
+            "scan_mode": self.scan_mode,
+            "assessment_complete": self.assessment_complete,
+            "coverage": self.coverage,
             "domain": self.domain,
             "dc_name": self.dc_name,
             "domain_admin": self.domain_admin,

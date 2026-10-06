@@ -32,7 +32,7 @@ class CommandResult:
 
     @property
     def ok(self) -> bool:
-        return self.error is None and not self.timed_out
+        return self.error is None and not self.timed_out and self.returncode == 0
 
     @property
     def combined(self) -> str:

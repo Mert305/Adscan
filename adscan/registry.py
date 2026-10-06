@@ -55,6 +55,31 @@ class ScanContext:
     reuse_targets: str | None = None  # kimliklerin deneneceği host'lar (IP/CIDR/dosya)
     found_credentials: list = field(default_factory=list)  # 1. aşamadan gelen kimlikler
 
+    @property
+    def has_auth(self) -> bool:
+        return bool(self.username and (self.password is not None or self.nthash
+                                      or self.use_kerberos))
+
+
+def plan_modules(modules, ctx, report):
+    """Filter unmet credential prerequisites before invoking any module."""
+    selected = []
+    report.scan_mode = "authenticated" if ctx.has_auth else "unauthenticated"
+    for mod in modules:
+        reason = ""
+        if mod.requires_creds and not ctx.has_auth:
+            reason = "Kimlik gerekli; kimliksiz taramada çalıştırılmadı"
+        elif ctx.has_auth and ctx.password is None and not ctx.nthash \
+                and not mod.name.startswith("nxc") and mod.name != "nmap":
+            reason = "Bu adaptör yalnızca Kerberos önbelleği ile çalışmayı desteklemiyor"
+        elif ctx.has_auth and ctx.password is None and mod.name == "windapsearch":
+            reason = "windapsearch adaptörü parola gerektiriyor; hash aktarımı desteklenmiyor"
+        if reason:
+            report.record_coverage(mod.name, "skipped", reason)
+        else:
+            selected.append(mod)
+    return selected
+
 
 # Bir modülün çalıştırıcısı ctx alır, komut sonuçları döndürür.
 RunFn = Callable[[ScanContext], list[CommandResult]]

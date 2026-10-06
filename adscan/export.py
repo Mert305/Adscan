@@ -171,7 +171,10 @@ def write_attack_graph(report: ScanReport, path: str) -> None:
     steps = [{"key": s.key, "title": s.title, "achieved": ok}
              for s, ok in _chain.evaluate(report)]
 
+    for edge in edges:
+        edge["verification"] = "unverified"
     graph = {
+        "verification_note": "Graf bağlantıları öneridir; bağımsız olarak doğrulanmamıştır.",
         "target": report.target,
         "domain": report.domain,
         "domain_admin": report.domain_admin,
@@ -187,7 +190,8 @@ def write_attack_graph(report: ScanReport, path: str) -> None:
 def write_csv(report: ScanReport, path: str) -> None:
     """Bulguları düz CSV olarak yazar (SIEM / takip tablosu için)."""
     cols = ["severity", "title", "target", "source", "mitre", "reference",
-            "description", "poc", "escalation", "remediation"]
+            "description", "poc", "escalation", "remediation",
+            "fingerprint", "verification", "object_id", "observed_at", "tool_version"]
     with open(path, "w", encoding="utf-8", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow(cols)
@@ -195,4 +199,5 @@ def write_csv(report: ScanReport, path: str) -> None:
             writer.writerow([
                 f.severity.label, f.title, f.target, f.source, f.mitre,
                 f.reference, f.description, f.poc, f.escalation, f.remediation,
+                f.fingerprint, f.verification, f.object_id, f.observed_at, f.tool_version,
             ])

@@ -101,7 +101,8 @@ def format_chain(report: ScanReport, *, color: bool = False) -> str:
     n = len(rows)
     bar = "■" * achieved + "□" * (n - achieved)
     head = f"SALDIRI YOLU  [{bar}]  {achieved}/{n} adım"
-    lines = ["", c(head, "bold")]
+    lines = ["", c(head, "bold"),
+             "   Bu yol sezgiseldir; işaretli adımlar bağımsız istismar doğrulaması değildir."]
     for i, (step, ok) in enumerate(rows):
         connector = "   │" if i else ""
         if connector:

@@ -15,7 +15,6 @@ import re
 
 from ..findings import Finding, ScanReport, Severity
 from ..runner import CommandResult, ToolStatus, resolve_tool, run, strip_dryrun
-from ..util import grep as _grep
 
 CERTIPY_CANDIDATES = ["certipy", "certipy-ad"]
 
@@ -89,7 +88,6 @@ def parse(results: list[CommandResult], report: ScanReport) -> None:
     report.raw_outputs["certipy"] = "\n\n".join(r.combined for r in results)
     combined = strip_dryrun("\n\n".join(r.combined for r in results))
     target = report.target
-    _cli = tool().name  # kurulu certipy adı (certipy / certipy-ad) — PoC'ler buna göre
 
     first = results[0] if results else None
     if first and first.tool == "certipy:skip":
@@ -98,40 +96,55 @@ def parse(results: list[CommandResult], report: ScanReport) -> None:
         report.add_error(f"certipy: {first.error or 'çalıştırılamadı'}")
         return
 
-    escs = sorted({int(n) for n in re.findall(r"\bESC(\d{1,2})\b", combined)})
-    if not escs:
-        return
-
-    # Savunmasız şablon + CA adlarını topla (PoC'yi GERÇEK değerlerle doldurmak için)
-    templates = re.findall(r"Template Name\s*:\s*(\S+)", combined)
-    ca_m = re.search(r"CA Name\s*:\s*(.+)", combined)
-    ca_name = ca_m.group(1).strip() if ca_m else ""
-    ca_s = ca_name or "<CA-ADI>"
-    tpl_s = templates[0] if templates else "<SAVUNMASIZ-TPL>"
-    desc = "; ".join(f"ESC{e}: {_ESC_DESC.get(str(e), 'ADCS yanlış yapılandırması')}"
-                     for e in escs)
-    report.add(Finding(
-        title=f"ADCS savunmasız: ESC{', ESC'.join(str(e) for e in escs)} — certipy",
-        severity=Severity.CRITICAL, target=target, source="certipy",
-        description="Certipy, Domain Admin'e yükseltmeye uygun ADCS yanlış "
-                    "yapılandırması buldu. " + desc,
-        evidence=_grep(combined, r"ESC\d+|Template Name|CA Name", context=0)
-                 + (f"\nŞablonlar: {', '.join(sorted(set(templates))[:10])}" if templates else ""),
-        remediation="Savunmasız şablonlarda enrollee-supplies-subject'i kapatın, EKU'ları "
-                    "kısıtlayın, şablon/CA ACL'lerini sıkılaştırın, HTTP enrollment'ta "
-                    "EPA+HTTPS zorunlu kılın.",
-        reference="ADCS ESC1-ESC8 (Certified Pre-Owned)",
-        poc=f"{_cli} find -u <user>@<domain> -p <pass> -dc-ip {target} -vulnerable -stdout "
-            "-ldap-scheme ldap",
-        escalation=(
-            f"ESC1/ESC4 — DA kimliğiyle sertifika iste (CA='{ca_s}', şablon='{tpl_s}'):\n"
-            f"1) {_cli} req -u <user>@<domain> -p <pass> -dc-ip {target} -ca {ca_s} "
-            f"-template {tpl_s} -upn administrator@<domain> -ldap-scheme ldap\n"
-            f"2) {_cli} auth -pfx administrator.pfx -dc-ip {target}    (TGT + NT hash döner)\n"
-            f"3) secretsdump.py <domain>/administrator@{target} -just-dc    -> krbtgt = DA\n"
-            "   • ya da NT hash ile: nxc smb <dc> -u administrator -H <nthash> --ntds\n"
-            "ESC8 (web enrollment): coerce + ntlmrelayx --adcs (bkz. coercion bulgusu).\n"
-            "ESC6/ESC9/ESC10: -upn ile SAN enjekte et; ESC3: enrollment agent sertifikası.")))
+    # Only explicit vulnerability entries belonging to a named object count.
+    # A banner, help text or reference mentioning ESC1 is not a finding.
+    obj = ""
+    kind = ""
+    vuln_indent = None
+    version_match = re.search(r"Certipy\s+v?(\d+(?:\.\d+)*)", combined)
+    for line in combined.splitlines():
+        name = re.match(r"\s*(Template Name|CA Name)\s*:\s*(\S.*)", line)
+        if name:
+            kind, obj = name.group(1), name.group(2).strip()
+            vuln_indent = None
+            continue
+        if line.strip() in {"Certificate Templates", "Certificate Authorities"} \
+                or re.fullmatch(r"\s*\d+\s*", line):
+            obj, vuln_indent = "", None
+            continue
+        if re.match(r"\s*\[[!*]\]\s*Vulnerabilities\s*$", line):
+            vuln_indent = len(line) - len(line.lstrip())
+            continue
+        if vuln_indent is None or not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent <= vuln_indent:
+            vuln_indent = None
+            continue
+        match = re.match(r"\s*ESC(\d{1,2})\s*:\s*(\S.*)", line)
+        if not match or not obj:
+            continue
+        esc, detail = match.groups()
+        if re.search(r"\bnot vulnerable\b|\bnot affected\b|\bdisabled\b|^none$|^false$",
+                     detail, re.IGNORECASE):
+            continue
+        report.add(Finding(
+            title=f"ADCS savunmasız: ESC{esc} — {obj} — certipy",
+            severity=Severity.HIGH, target=target, source="certipy",
+            control_id=f"adcs.esc{esc}", object_id=f"{kind}:{obj}",
+            verification="tool_reported",
+            tool_version=version_match.group(1) if version_match else "unknown",
+            description="Certipy yapılandırma riski bildirdi; mevcut kimlikle "
+                        "istismar edilebilirlik ve Domain Admin erişimi doğrulanmadı.",
+            evidence=f"{kind}: {obj}\nESC{esc}: {detail}",
+            remediation="İlgili CA/şablonun enrollment izinlerini, ACL, EKU ve "
+                        "sertifika eşleme politikasını inceleyip gereksiz hakları kaldırın.",
+            reference=f"ADCS ESC{esc}",
+            poc="Aynı nesnede yapılandırma ve etkin erişim izinlerini yeniden kontrol edin.",
+            escalation="Önkoşullar doğrulanmadı; olası etki bağımsız inceleme gerektirir."))
+    if re.search(r"\bESC\d+\b", combined) and not any(
+            f.source == "certipy" for f in report.findings):
+        report.add_error("certipy: ESC metni var ancak nesneye bağlı olumlu bulgu ayrıştırılamadı")
 
 
 # ---------------------------------------------------------------------------

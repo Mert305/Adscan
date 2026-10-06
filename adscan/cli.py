@@ -50,9 +50,10 @@ from . import (
 from . import chain as chaining
 from . import live as live_ui
 from . import report as reporting
+from .assessment import record_results
 from .findings import Credential, Finding, ScanReport, Severity
 from .modules import nxc_scan, spray_scan, windap_scan
-from .registry import ScanContext, get_module, noise_of, select_modules
+from .registry import ScanContext, get_module, noise_of, plan_modules, select_modules
 from .runner import resolve_tool
 
 CONSENT_TEXT = (
@@ -489,12 +490,12 @@ def _in_scope(target: str, scope_file: str) -> tuple[bool, str]:
 
     for tok in (t.strip() for t in target.split(",") if t.strip()):
         try:
-            ip = ipaddress.ip_address(tok.split("/")[0])
-            if not any(ip in n for n in nets):
+            requested = ipaddress.ip_network(tok, strict=False)
+            if not any(requested.version == n.version and requested.subnet_of(n) for n in nets):
                 return False, f"{tok} hiçbir izinli ağda değil"
         except ValueError:
             low = tok.lower()
-            if not any(low == h or low.endswith("." + h) for h in hosts):
+            if not any(low == h for h in hosts):
                 return False, f"{tok} izinli host listesinde değil"
     return True, ""
 
@@ -572,10 +573,14 @@ def _worker(mod, ctx, ui: live_ui.Live):
 def _finish_module(ui: live_ui.Live, mod, results, report) -> None:
     """Bir modül bitince: hemen ayrıştır ve SADECE o modülün bulgularını bas."""
     n0, c0 = len(report.findings), len(report.credentials)
+    parse_failed = False
     try:
         mod.parse(results, report)
     except Exception as exc:  # ayrıştırma çökse de tarama sürsün
+        parse_failed = True
         report.add_error(f"{mod.name}: ayrıştırma hatası: {exc}")
+    record_results(report, mod.name, results, parse_failed=parse_failed,
+                   findings=len(report.findings) > n0)
     pocfill.fill(report)  # PoC'lerdeki <user>/<pass>'i bilinen kimlikle doldur
     ui.advance()
     _push_stats(ui, report)
@@ -595,7 +600,10 @@ def _finish_module(ui: live_ui.Live, mod, results, report) -> None:
         for f in new:
             ui.log(reporting.render_finding(f, color=ui.color))
     else:
-        ui.log(f"  {_c('✔', 'green', ui.color)} {mod.label} — temiz / bulgu yok{el}")
+        incomplete = any(c["module"] == mod.name and c["status"] not in
+                         {"completed", "findings", "not_applicable"} for c in report.coverage)
+        label = "değerlendirme eksik" if incomplete else "bulgu üretilmedi"
+        ui.log(f"  {mod.label} — {label}{el}")
 
     for cr in new_creds:
         ui.log(reporting.render_credential(cr, color=ui.color))
@@ -608,7 +616,14 @@ def _run_modules_live(modules, ctx, report, jobs: int) -> None:
     try:
         if jobs == 1 or len(modules) == 1:
             for mod in modules:
-                _finish_module(ui, mod, _worker(mod, ctx, ui), report)
+                try:
+                    results = _worker(mod, ctx, ui)
+                except Exception as exc:
+                    report.add_error(f"{mod.name}: beklenmeyen hata: {exc}")
+                    report.record_coverage(mod.name, "failed", "Modül çalıştırılamadı")
+                    ui.advance()
+                    continue
+                _finish_module(ui, mod, results, report)
         else:
             with ThreadPoolExecutor(max_workers=jobs) as pool:
                 futs = {pool.submit(_worker, mod, ctx, ui): mod for mod in modules}
@@ -618,6 +633,7 @@ def _run_modules_live(modules, ctx, report, jobs: int) -> None:
                         res = fut.result()
                     except Exception as exc:  # modül çökse de diğerleri sürsün
                         report.add_error(f"{mod.name}: beklenmeyen hata: {exc}")
+                        report.record_coverage(mod.name, "failed", "Modül çalıştırılamadı")
                         ui.advance()
                         ui.log(f"  {_c('✘', 'red', ui.color)} {mod.label} — HATA: {exc}")
                         continue
@@ -938,7 +954,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--crack", action="store_true",
         help="Harvest edilen kerberoast/AS-REP hash'lerini (loot/kerb.txt, loot/asrep.txt) "
              "hashcat/john ile kır; kırılan parolaları zincire kimlik olarak besle. "
-             "(--auto/--full bunu otomatik yapar.)")
+             "(--auto bunu otomatik yapar; --full için açıkça --crack gerekir.)")
     cr.add_argument(
         "--wordlist", metavar="DOSYA",
         help="Kırma sözlüğü (varsayılan: otomatik rockyou.txt araması).")
@@ -1112,6 +1128,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- kimlik bilgisi çözümleme (güvenli) ---
     password = _resolve_password(args)
+    if args.full and args.username and password is None and not args.nthash and not args.kerberos:
+        print("HATA: --full ile -u için --ask-pass, -p, -H veya -k gerekli.")
+        return 2
+    if args.full and not args.username and (password is not None or args.nthash or args.kerberos):
+        print("HATA: kimlikli --full için -u gerekli.")
+        return 2
     spray_passwords = _resolve_spray_passwords(args)
 
     # --- modül seçimi (registry) ---
@@ -1132,6 +1154,8 @@ def main(argv: list[str] | None = None) -> int:
             # bloodyAD: açıkça --bloodyad ile ya da kimlikli auto/assume-breach'te otomatik
             if args.bloodyad or ((args.auto or args.assume_breach) and args.username):
                 modules.append(get_module("bloodyad"))
+            if args.full:
+                modules.append(get_module("bloodyad-enum"))
             # BloodHound/MSSQL/WinRM: açıkça bayrakla istenirse ekle (opt-in, kimlik ister)
             if args.bloodhound:
                 modules.append(get_module("bloodhound"))
@@ -1148,7 +1172,9 @@ def main(argv: list[str] | None = None) -> int:
     modules = [m for m in modules if m.name != "reuse"]
 
     # --quiet: OPSEC — yalnızca düşük gürültülü modülleri bırak (açık --only hariç)
+    selection_skips = []
     if args.quiet and only is None:
+        selection_skips = [m for m in modules if noise_of(m.name) != "low"]
         before = len(modules)
         modules = [m for m in modules if noise_of(m.name) == "low"]
         dropped = before - len(modules)
@@ -1209,6 +1235,9 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     report = ScanReport(target=args.target, outdir=args.outdir)
+    for mod in selection_skips:
+        report.record_coverage(mod.name, "skipped", "--quiet filtresi")
+    modules = plan_modules(modules, ctx, report)
 
     # Bu çalışmanın temizlik kuyruğu taze başlasın (manifest yalnızca bu koşuyu kapsar)
     cleanup.reset()
@@ -1245,12 +1274,12 @@ def main(argv: list[str] | None = None) -> int:
             "ASSUME-BREACH (kimlikle doğrudan DA)" if args.assume_breach else
             "ENUM + zafiyet taraması")
     if args.full:
-        mode = "KAPSAMLI · " + mode
+        mode = ("KAPSAMLI KİMLİKLİ · " if ctx.has_auth else "KAPSAMLI KİMLİKSİZ · ") + mode
     who = (f"{args.username}" + (f"@{args.domain}" if args.domain else "")
            if args.username else "kimliksiz (null/anonim)")
     print(reporting.render_header_box(args.target, mode, who, len(modules), jobs, color))
     # Kerberos'a dokunan akışlarda (kimlik / -k / auto / assume-breach) saat farkını düzelt
-    if args.username or args.kerberos or args.auto or args.assume_breach:
+    if not args.dry_run and (args.username or args.kerberos or args.auto or args.assume_breach):
         _setup_clock(args, color)
     print(_c("  (her modül biter bitmez sonucu görünecek)", "dim", color) + "\n")
 
@@ -1268,7 +1297,7 @@ def main(argv: list[str] | None = None) -> int:
     _print_dc_banner(report, args.target, color)
 
     # --- çevrimdışı kırma: kerberoast/AS-REP hash'lerini kır (autopilot/escalate'ten ÖNCE) ---
-    if args.crack or args.auto or args.full:
+    if args.crack or args.auto:
         _run_crack_phase(args, ctx, report, color)
 
     # --- BloodHound yol analizi: toplanan grafikte DA'ya en kısa yolu çıkar (veri varsa) ---
@@ -1396,7 +1425,7 @@ def main(argv: list[str] | None = None) -> int:
             for t in new:
                 print(_c(f"    + YENİ: {t}", "green", color))
             for t in resolved:
-                print(_c(f"    - ÇÖZÜLDÜ/KAYBOLDU: {t}", "dim", color))
+                print(_c(f"    - BU TARAMADA GÖRÜLMEDİ (çözüldüğü doğrulanmadı): {t}", "dim", color))
 
     # Aktif/spray modülü çalıştıysa yetki yükseltme zinciri özetini göster
     if (args.auto or args.assume_breach or stage2

@@ -55,14 +55,14 @@ def test_risk_score_weighted_and_capped():
     r.add(Finding(title="a", severity=Severity.CRITICAL, target="t", source="x"))
     r.add(Finding(title="b", severity=Severity.HIGH, target="t", source="x"))
     assert r.risk_score() == 55  # 40 + 15
-    for _ in range(10):
-        r.add(Finding(title="c", severity=Severity.CRITICAL, target="t", source="x"))
+    for i in range(10):
+        r.add(Finding(title=f"c{i}", severity=Severity.CRITICAL, target="t", source="x"))
     assert r.risk_score() == 100  # 100'de kırpılır
 
 
 def test_risk_label_thresholds():
     r = ScanReport(target="t")
-    assert r.risk_label() == "TEMİZ"
+    assert r.risk_label() == "DEĞERLENDİRME EKSİK"
     r.add(Finding(title="l", severity=Severity.LOW, target="t", source="x"))
     assert r.risk_label() == "DÜŞÜK"
 
