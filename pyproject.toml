@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adscan"
+version = "0.3.0"
+description = "Active Directory pentest yardımcı orkestratörü (nmap + netexec + windapsearch + certipy + bloodyAD + BloodHound)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "adscan" }]
+keywords = ["active-directory", "pentest", "netexec", "security", "ad"]
+dependencies = []  # yalnızca standart kütüphane; harici CLI araçları PATH'te olmalı
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.5", "mypy>=1.8"]
+
+[project.scripts]
+adscan = "adscan.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["adscan*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+# E501: uzun satırlar (rapor/escalation metinleri); E402: modül sonu kayıt importları (noqa'lı)
+ignore = ["E501", "E402"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402", "F401"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = false
+# Kademeli tip kontrolü: şimdilik gevşek (CI'da bilgi amaçlı)
+check_untyped_defs = false

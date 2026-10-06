@@ -1,0 +1,7 @@
+# adscan yalnızca Python standart kütüphanesini kullanır (ek paket gerekmez).
+#
+# Harici CLI araçları ayrıca kurulu olmalıdır (PATH üzerinde):
+#   - nmap          https://nmap.org/download
+#   - netexec (nxc) https://github.com/Pennyw0rth/NetExec   ->  pipx install netexec
+#   - windapsearch  https://github.com/ropnop/go-windapsearch (binary) veya
+#                   https://github.com/ropnop/windapsearch (python)

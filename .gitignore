@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Test / lint cache
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# adscan çıktıları (rapor + loot: hassas olabilir, repoya girmesin)
+adscan-reports/
+loot/
+
+# Ortam
+.venv/
+venv/
+
+# Kişisel araç notları (repoya girmesin)
+/ad
