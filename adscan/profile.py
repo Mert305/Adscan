@@ -20,6 +20,7 @@ import os
 # Profilden kabul edilen argparse dest'leri (bilinmeyen anahtarlar reddedilir —
 # yazım hatası sessizce yutulmasın, bir şey ezmesin).
 ALLOWED_KEYS = {
+    "terminal_ui",
     "target", "username", "password", "nthash", "domain", "only", "jobs", "outdir",
     "timeout", "redact", "kerberos", "retries", "scope", "audit_log", "html",
     "no_extra_reports", "nxc_workspace", "no_nxc_db", "keep_old_reports",
@@ -29,6 +30,7 @@ ALLOWED_KEYS = {
     "spray_users", "spray_delay", "spray_force",
     "active_attacks", "launch", "interface", "listener_ip", "relay_targets",
     "adcs_ca_url", "capture_seconds", "reuse", "reuse_targets",
+    "context_label", "context_role", "compare_reports", "acl_snapshot",
 }
 
 

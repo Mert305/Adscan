@@ -8,6 +8,7 @@ Olay türleri (kind):
   "start" — modül çalışmaya başladı            (module=label)
   "cmd"   — bir harici komut çalıştırılıyor     (module=adım, text=komut)
   "info"  — anlamlı durum (null session vb.)    (module=ad, text=mesaj)
+  "control" — araç sonucu (text=durum JSON; ham çıktı ve kimlik içermez)
 """
 
 from __future__ import annotations

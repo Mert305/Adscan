@@ -10,10 +10,13 @@ dist/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.test-tmp*/
+checkpoint-*.json
 
 # adscan çıktıları (rapor + loot: hassas olabilir, repoya girmesin)
 adscan-reports/
 loot/
+bh/
 
 # Ortam
 .venv/

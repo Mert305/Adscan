@@ -16,10 +16,20 @@ REDACT = False
 DEBUG = False  # --debug: ham komut/hata ayrıntılarını göster
 AUDIT_LOG: str | None = None  # ayarlıysa çalıştırılan HER komut buraya yazılır
 RETRIES = 2  # geçici bağlantı hatalarında komut başına yeniden deneme sayısı
+TERMINAL_UI = "compact"
 
 # Her alt sürece (subprocess) eklenecek ortam değişkenleri. Kerberos saat-kayması
 # düzeltmesi (faketime) bunu kullanır; boşsa süreçler normal ortamı miras alır.
 CHILD_ENV: dict[str, str] = {}
+
+# Pivoting: ağa dönük tüm komutları `proxychains -q` ile sararak ele geçirilen
+# bir host üzerinden (SOCKS) iç ağı taramayı sağlar. None/False = kapalı.
+PROXYCHAINS: bool = False
+
+
+def set_proxychains(value: bool) -> None:
+    global PROXYCHAINS
+    PROXYCHAINS = bool(value)
 
 _audit_lock = threading.Lock()
 

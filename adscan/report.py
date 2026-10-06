@@ -6,9 +6,12 @@ import json
 import os
 import re
 import shutil
+import sys
 from datetime import datetime
 
+from . import config
 from .findings import ScanReport, Severity
+from .terminal import cells, fit, table, wrap
 
 # ANSI renkleri (Windows 10+ terminalleri destekler)
 _COLORS = {
@@ -48,7 +51,7 @@ def _strip_ansi(text: str) -> str:
 
 def _vlen(text: str) -> int:
     """Görünür (ANSI'siz) uzunluk — kutu hizalaması için."""
-    return len(_strip_ansi(text))
+    return cells(text)
 
 
 def _termwidth(default: int = 80) -> int:
@@ -62,15 +65,17 @@ def _paint(code: str, text: str, color: bool) -> str:
 def _box(title: str, rows: list[str], *, color: bool, accent: str = _BRAND,
          width: int | None = None) -> str:
     """Yuvarlak köşeli bir kutu çizer; satırlar ANSI içerebilir (hizalama korunur)."""
-    w = min(width or 68, max(40, _termwidth() - 2))
+    w = min(width or 68, max(8, _termwidth() - 2))
     inner = w - 2
-    t = f" {title} "
+    t = fit(f" {title} ", inner - 1)
     fill = max(0, inner - 1 - _vlen(t))
     out = [_paint(accent, "╭─" + t + "─" * fill, color) + _paint(accent, "╮", color)]
     for r in rows:
-        pad = max(0, inner - 1 - _vlen(r))
-        out.append(_paint(accent, "│", color) + " " + r + " " * pad
-                   + _paint(accent, "│", color))
+        parts = [r] if cells(r) <= inner - 1 else wrap(r, inner - 1)
+        for part in parts:
+            pad = max(0, inner - 1 - _vlen(part))
+            out.append(_paint(accent, "│", color) + " " + part + " " * pad
+                       + _paint(accent, "│", color))
     out.append(_paint(accent, "╰" + "─" * inner + "╯", color))
     return "\n".join(out)
 
@@ -91,12 +96,17 @@ def _tile(label: str, value: str, vcolor: str, color: bool, w: int = 13) -> list
 
 def _tiles_row(tiles: list[tuple[str, str, str]], color: bool) -> str:
     """Birden çok kutucuğu yan yana basar. tiles: (label, value, vcolor)."""
-    cols = [_tile(lbl, val, vc, color, w=14) for lbl, val, vc in tiles]
-    return "\n".join("  " + "  ".join(col[i] for col in cols) for i in range(4))
+    group = max(1, (_termwidth() - 2) // 16)
+    output = []
+    for start in range(0, len(tiles), group):
+        cols = [_tile(lbl, val, vc, color, w=min(14, max(6, _termwidth() - 3)))
+                for lbl, val, vc in tiles[start:start + group]]
+        output.extend("  " + "  ".join(col[i] for col in cols) for i in range(4))
+    return "\n".join(output)
 
 
 def _supports_color() -> bool:
-    if os.environ.get("NO_COLOR"):
+    if os.environ.get("NO_COLOR") or not sys.stdout.isatty() or config.TERMINAL_UI == "plain":
         return False
     if os.name == "nt":
         # Windows Terminal / VT etkinleştirme
@@ -159,6 +169,14 @@ def _finding_bar(color: bool, sev: Severity) -> str:
 
 def render_finding(f, *, color: bool, index: int | None = None) -> str:
     """Tek bir bulguyu renkli, sol-şeritli 'kart' olarak çizer."""
+    if config.TERMINAL_UI != "detailed":
+        rows = [f.title, f"{f.source} · {f.target} · doğrulama: {f.verification}"]
+        if f.evidence:
+            rows.append("Kanıt: " + fit(' '.join(f.evidence.split()), 160))
+        if f.remediation:
+            rows.append("Düzeltme: " + fit(' '.join(f.remediation.split()), 180))
+        return _box(f.severity.label, rows, color=color,
+                    accent=_SEV_FG[f.severity])
     bar = _finding_bar(color, f.severity)
     icon = _paint(_SEV_FG[f.severity], _SEV_ICON[f.severity], color)
     badge = _c(f" {f.severity.label} ", f.severity, color)
@@ -177,6 +195,12 @@ def render_finding(f, *, color: bool, index: int | None = None) -> str:
     if f.evidence:
         ev = f.evidence.strip().replace("\n", "\n    ")
         blocks.append(_paint(_DIM, "kanıt", color) + "\n    " + ev)
+    if getattr(f, "command", ""):
+        if "\n" in f.command:
+            cmd_body = f.command.strip().replace("\n", "\n    ")
+            blocks.append(_paint(_BRAND2, "⌘ çalıştırılan komut", color) + "\n    " + cmd_body)
+        else:
+            blocks.append(_paint(_BRAND2, "⌘ komut   ", color) + f.command)
     if f.poc:
         if "\n" in f.poc:
             poc_body = f.poc.strip().replace("\n", "\n    ")
@@ -197,7 +221,10 @@ def render_finding(f, *, color: bool, index: int | None = None) -> str:
 
     raw = "\n".join(blocks)
     # Her fiziksel satırı seviye renginde sol şeritle öne-ekle (kart görünümü)
-    return "\n".join((bar + " " + ln) if ln.strip() else bar for ln in raw.split("\n"))
+    lines = []
+    for ln in raw.split("\n"):
+        lines.extend([ln] if cells(ln) <= _termwidth() - 3 else wrap(ln, max(8, _termwidth() - 3)))
+    return "\n".join((bar + " " + ln) if ln.strip() else bar for ln in lines)
 
 
 def _sevbar(report: ScanReport, color: bool) -> str:
@@ -257,6 +284,35 @@ def _risk_banner(report: ScanReport, color: bool) -> str:
                 accent=_RISK_FG.get(label, _BRAND), width=62)
 
 
+def render_coverage(report: ScanReport) -> str:
+    """Count actual controls once; never equate module completion with coverage."""
+    controls = [c for c in report.coverage if c.get("level") == "control"]
+    if not controls:
+        return "Kontrol kapsamı: henüz gözlem yok."
+    labels = {"completed": "tamamlandı", "findings": "bulgu", "access_denied": "erişim yetersiz",
+              "failed": "hata", "unknown": "belirsiz", "skipped": "atlandı",
+              "planned": "planlandı", "not_applicable": "uygulanamaz"}
+    modules = sorted({c["module"] for c in controls})
+    rows = []
+    for module in modules:
+        subset = [c for c in controls if c["module"] == module]
+        rows.append((module, str(sum(c["status"] in {"completed", "findings"} for c in subset)),
+                     str(sum(c["status"] == "access_denied" for c in subset)),
+                     str(sum(c["status"] == "failed" for c in subset)),
+                     str(sum(c["status"] not in {"completed", "findings", "access_denied", "failed"} for c in subset)),
+                     str(sum(bool(c.get("resumed")) for c in subset))))
+    output = ["KONTROL KAPSAMI (diğer: bekleyen / atlanan / belirsiz / uygulanamaz)",
+              table(["Modül", "Tamam", "Erişim yok", "Hata", "Diğer", "Checkpoint"], rows)]
+    incomplete = [c for c in controls if c["status"] not in {"completed", "findings", "not_applicable"}]
+    limit = len(incomplete) if config.TERMINAL_UI == "detailed" else 8
+    for c in incomplete[:limit]:
+        output.extend(wrap(f"[{labels.get(c['status'], c['status'])}] {c.get('label') or c['control_id']}: {c['reason']}",
+                           max(8, _termwidth() - 1)))
+    if len(incomplete) > limit:
+        output.append(f"… {len(incomplete) - limit} ek kontrol: ayrıntılı görünüm veya HTML raporu.")
+    return '\n'.join(output)
+
+
 def print_recap(report: ScanReport, *, saved: list[str] | None = None) -> None:
     """Tarama sonunda görsel özet panosu: kutucuklar + çubuk grafik + dizin.
 
@@ -284,9 +340,7 @@ def print_recap(report: ScanReport, *, saved: list[str] | None = None) -> None:
     # --- yönetici özeti: risk puanı + en kritik bulgular ---
     print(_risk_banner(report, color))
     print(f"  {report.assessment_label()} · {report.scan_mode}")
-    for c in report.coverage:
-        if c["status"] not in {"completed", "findings"}:
-            print(f"  [{c['status']}] {c['control_id']}: {c['reason']}")
+    print(render_coverage(report))
     print()
 
     # --- başlık + hedef/DC kutusu ---
@@ -411,11 +465,35 @@ def write_markdown(report: ScanReport, path: str) -> None:
     lines.append(f"*Oluşturulma:* {datetime.now():%Y-%m-%d %H:%M:%S}")
     lines.append(f"\n**Değerlendirme:** {report.assessment_label()}")
     lines.append(f"\n**Tarama modu:** {report.scan_mode}")
+    if report.execution_context:
+        lines.append(f"\n**Test kimliği:** {report.execution_context.get('label', '')}")
+    if report.comparison.get("sessions"):
+        lines.extend(["", "## Test Kapsamı Karşılaştırması", ""])
+        sessions = report.comparison["sessions"]
+        headings = ["Kontrol"] + [s["label"] for s in sessions]
+        def md_cell(value):
+            return str(value).replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+        lines.append("| " + " | ".join(md_cell(h) for h in headings) + " |")
+        lines.append("| " + " | ".join("---" for _ in headings) + " |")
+        for row in report.comparison["controls"]:
+            cells = [row["target"] + " / " + row["control_id"]] + [c["status"] for c in row["cells"]]
+            lines.append("| " + " | ".join(md_cell(c) for c in cells) + " |")
+        lines.extend(["", "Farklar kimlik etkisini tek başına kanıtlamaz; zaman, araç ve kapsam farklı olabilir."])
+    if report.effective_rights:
+        lines.extend(["", "## Etkin Yetki Analizi", "",
+                      "| Kimlik | Nesne | Hak | Karar | Kanıt türü | Açıklama |", "|---|---|---|---|---|---|"])
+        for item in report.effective_rights:
+            cells = [str(item[key]).replace("|", "\\|").replace("\n", " ")
+                     for key in ("principal", "object_id", "permission", "decision", "verification", "reason")]
+            lines.append("| " + " | ".join(cells) + " |")
     lines.extend(["", "## Kontrol Kapsamı", "",
-                  "| Kontrol | Durum | Açıklama |", "|---|---|---|"])
+                  "| Modül | Kontrol | Durum | Açıklama | Kaynak |", "|---|---|---|---|---|"])
     for c in report.coverage:
+        if c.get("level") == "module":
+            continue
         cells = [str(c[k]).replace("|", "\\|").replace("\n", " ")
-                 for k in ("control_id", "status", "reason")]
+                 for k in ("module", "control_id", "status", "reason")]
+        cells.append("Checkpoint" if c.get("resumed") else "Bu tarama")
         lines.append("| " + " | ".join(cells) + " |")
     lines.append("")
 
@@ -461,6 +539,15 @@ def write_markdown(report: ScanReport, path: str) -> None:
                          + (f" ({_mitre.TECH_NAMES[f.mitre]})" if f.mitre in _mitre.TECH_NAMES else ""))
         if f.description:
             lines.append(f"- **Açıklama:** {f.description}")
+        if getattr(f, "command", ""):
+            if "\n" in f.command:
+                lines.append("- **Çalıştırılan komut:**")
+                lines.append("")
+                lines.append("```bash")
+                lines.append(f.command.strip())
+                lines.append("```")
+            else:
+                lines.append(f"- **Çalıştırılan komut:** `{f.command}`")
         if f.poc:
             if "\n" in f.poc:
                 lines.append("- **Doğrula (PoC):**")
@@ -539,6 +626,8 @@ def write_html(report: ScanReport, path: str) -> None:
     """Tek dosyalık, bağımsız (inline CSS) HTML rapor üretir."""
     from . import chain as chaining
     from . import mitre as _mitre
+    from . import report_ui
+    from .report_panels import comparison_panel, permissions_panel
 
     counts = report.count_by_severity()
     parts: list[str] = []
@@ -553,14 +642,26 @@ def write_html(report: ScanReport, path: str) -> None:
                if report.dc_name and report.domain else (report.dc_name or "—"))
 
     rows = []
+    used_fingerprints = set()
     for i, f in enumerate(report.sorted_findings(), 1):
+        anchor = f.fingerprint if f.fingerprint not in used_fingerprints else f"{f.fingerprint}-{i}"
+        used_fingerprints.add(f.fingerprint)
         color = _HTML_SEV[f.severity]
         mitre_txt = ""
         if f.mitre:
             name = _mitre.TECH_NAMES.get(f.mitre, "")
             mitre_txt = (f'<div class="kv"><b>MITRE ATT&amp;CK:</b> '
                          f'<code>{_esc(f.mitre)}</code> {_esc(name)}</div>')
-        ev = (f'<pre>{_esc(f.evidence.strip())}</pre>' if f.evidence.strip() else "")
+        ev = (f'<div id="evidence-{anchor}"><b>Kanıt:</b>'
+              f'<pre>{_esc(f.evidence.strip())}</pre></div>' if f.evidence.strip() else "")
+        # Çalıştırılan komut: adscan'in bulguyu üretirken gerçekten koştuğu komut(lar)
+        if not getattr(f, "command", ""):
+            cmd_html = ""
+        elif "\n" in f.command:
+            cmd_html = (f'<div class="kv"><b>Çalıştırılan komut:</b></div>'
+                        f'<pre>{_esc(f.command.strip())}</pre>')
+        else:
+            cmd_html = f'<div class="kv"><b>Çalıştırılan komut:</b> <code>{_esc(f.command)}</code></div>'
         # PoC: çok-satırlıysa <pre> blok, tek satırsa inline <code>
         if not f.poc:
             poc_html = ""
@@ -578,7 +679,9 @@ def write_html(report: ScanReport, path: str) -> None:
         else:
             esc_html = f'<div class="kv"><b>Yükseltme:</b> {_esc(f.escalation)}</div>'
         rows.append(f"""
-        <details class="finding" open>
+        <details class="finding" id="finding-{anchor}" open
+          data-severity="{f.severity.label}" data-target="{_esc(f.target)}"
+          data-verification="{_esc(f.verification)}" data-module="{_esc(f.source)}">
           <summary><span class="tag" style="background:{color}">{f.severity.label}</span>
             <span class="ftitle">{i}. {_esc(f.title)}</span>
             <span class="src">{_esc(f.source)}</span></summary>
@@ -586,9 +689,11 @@ def write_html(report: ScanReport, path: str) -> None:
             {f'<div class="kv"><b>Hedef:</b> {_esc(f.target)}</div>'}
             <div class="kv"><b>Doğrulama:</b> {_esc(f.verification)} · {_esc(f.observed_at)}</div>
             <div class="kv"><b>Bulgu kimliği:</b> {_esc(f.fingerprint)}</div>
+            {'<a href="#evidence-' + anchor + '">Kanıta git</a>' if f.evidence.strip() else ''}
             {f'<div class="kv"><b>Referans:</b> {_esc(f.reference)}</div>' if f.reference else ''}
             {mitre_txt}
             {f'<div class="kv"><b>Açıklama:</b> {_esc(f.description)}</div>' if f.description else ''}
+            {cmd_html}
             {poc_html}
             {esc_html}
             {f'<div class="kv"><b>Çözüm:</b> {_esc(f.remediation)}</div>' if f.remediation else ''}
@@ -616,11 +721,36 @@ def write_html(report: ScanReport, path: str) -> None:
         lis = "".join(f"<li>{_esc(e)}</li>" for e in report.errors)
         errors_html = f"<h2>Uyarılar</h2><ul class='warn'>{lis}</ul>"
 
+    priority_findings = [f for f in report.sorted_findings() if f.severity >= Severity.MEDIUM]
+    priority = "".join(
+        f'<li><a href="#finding-{f.fingerprint}">{_esc(f.title)}</a> '
+        f'({f.severity.label} · {_esc(f.target)} · {_esc(f.verification)})'
+        f'<div>{_esc(f.remediation or "Düzeltme önerisi belirtilmedi; teknik kanıtı inceleyin.")}</div></li>'
+        for f in priority_findings[:10])
+    if len(priority_findings) > 10:
+        priority += '<li><a href="#findings">Diğer bulguları incele</a></li>'
+    controls = [c for c in report.coverage if c.get("level") != "module"]
+    coverage_rows = "".join(
+        f'<tr class="coverage-row" data-module="{_esc(c["module"])}" '
+        f'data-target="{_esc(c["target"])}" data-status="{_esc(c["status"])}">'
+        + "".join('<td>' + _esc(str(value)) + '</td>' for value in (
+            c["module"], c.get("label", c["control_id"]), c["control_id"], c["target"],
+            c["status"], c["reason"], c.get("observed_at", ""),
+            "Checkpoint" if c.get("resumed") else "Bu tarama")) + '</tr>' for c in controls)
+    compared = len(report.comparison.get("sessions", []))
+    completed_controls = sum(c["status"] in {"completed", "findings"} for c in controls)
+    high_findings = sum(f.severity >= Severity.HIGH for f in report.findings)
+    calculated = sum(r.get("verification") == "calculated" for r in report.effective_rights)
+    unknown_rights = sum(r.get("decision") == "unknown" for r in report.effective_rights)
+    context_label = report.execution_context.get("label") or report.scan_mode
+    comparison_html = comparison_panel(report)
+    permissions_html = permissions_panel(report)
     html = f"""<!doctype html>
 <html lang="tr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AD Tarama Raporu — {_esc(report.target)}</title>
 <style>
+  {report_ui.STYLE}
   :root {{ --bg:#0f1115; --card:#1a1d24; --fg:#e6e6e6; --muted:#9aa0a6; --line:#2a2e37; }}
   @media (prefers-color-scheme: light) {{
     :root {{ --bg:#f5f6f8; --card:#fff; --fg:#1a1a1a; --muted:#666; --line:#e2e4e8; }} }}
@@ -656,29 +786,70 @@ def write_html(report: ScanReport, path: str) -> None:
     padding:12px; white-space:pre-wrap; font-family:ui-monospace,Menlo,Consolas,monospace;
     font-size:12.5px; }}
 </style></head>
-<body><div class="wrap">
-  <h1>AD Tarama Raporu — {_esc(report.target)}</h1>
+<body><div class="wrap report-shell">
+  <header class="app-header"><div class="brand-mark"><span class="brand-icon">A</span>ADSCAN
+  <span class="eyebrow">Assessment workspace</span></div><div class="actions">
+  <button id="theme-toggle" type="button" aria-pressed="false">Tema</button>
+  <button id="print-report" type="button">Yazdır / PDF</button></div></header>
+  <div class="hero"><div class="eyebrow">Active Directory değerlendirmesi</div>
+  <h1>{_esc(report.target)}</h1>
+  <p>Kontrol kapsamı, kimlik farkları ve açıklanabilir yetki analizi.</p>
   <div class="meta">Oluşturulma: {datetime.now():%Y-%m-%d %H:%M:%S}
     &nbsp;·&nbsp; DC: {_esc(dc_fqdn)} &nbsp;·&nbsp; domain: {_esc(report.domain or '—')}
     {' &nbsp;·&nbsp; <b style="color:#b00020">DOMAIN ADMIN ELDE EDİLDİ</b>' if report.domain_admin else ''}</div>
   <div class="summary">
     <span class="pill" style="background:{_risk_html_color(report.risk_label())}">
       RİSK: {report.risk_label()} — {report.risk_score()}/100</span>
-    {summary}</div>
+    {summary}</div><div class="meta">Test bağlamı: {_esc(context_label)}</div></div>
+  <div class="dashboard-stats">
+    <article class="stat-card"><div class="eyebrow">Kritik / yüksek</div><strong>{high_findings}</strong><small>{len(report.findings)} toplam bulgu</small></article>
+    <article class="stat-card"><div class="eyebrow">Kontrol kapsamı</div><strong>{completed_controls}<small> / {len(controls)}</small></strong><small>{_esc(report.assessment_label())}</small></article>
+    <article class="stat-card"><div class="eyebrow">Karşılaştırılan tarama</div><strong>{compared}</strong><small>{report.comparison.get('different_controls', 0)} kontrol durumu farkı</small></article>
+    <article class="stat-card"><div class="eyebrow">Yetki değerlendirmesi</div><strong>{len(report.effective_rights)}</strong><small>{calculated} hesaplanan · {unknown_rights} belirsiz</small></article>
+  </div>
+  <nav class="tabs" role="tablist" aria-label="Rapor bölümleri">
+    <button id="tab-overview" role="tab" aria-controls="overview" aria-selected="true">Genel bakış</button>
+    <button id="tab-findings" role="tab" aria-controls="findings" aria-selected="false">Bulgular <span class="tab-count">{len(report.findings)}</span></button>
+    <button id="tab-coverage" role="tab" aria-controls="coverage" aria-selected="false">Kapsam <span class="tab-count">{len(controls)}</span></button>
+    <button id="tab-comparison" role="tab" aria-controls="comparison" aria-selected="false">Kimlik karşılaştırması <span class="tab-count">{compared}</span></button>
+    <button id="tab-permissions" role="tab" aria-controls="permissions" aria-selected="false">Etkin yetkiler <span class="tab-count">{len(report.effective_rights)}</span></button>
+  </nav>
+  <div class="toolbar">{report_ui.FILTERS}</div>
 
+  <section class="panel" id="overview" role="tabpanel" aria-labelledby="tab-overview">
+  <h2>Öncelikli Düzeltmeler</h2>
+  <p>Önem derecesine göre sıralanır. Doğrulama durumu, kanıtın niteliğini gösterir.</p>
+  <ol class="priority">{priority or '<li>Önceliklendirilecek bulgu kaydı yok. Kontrol kapsamını inceleyin.</li>'}</ol>
   <h2>Saldırı Yolu</h2>
-  <div class="chain">{chain_txt}</div>
+  <details id="chain-details"><summary>Yol analizini ve teknik adımları incele</summary>
+  <div class="chain">{chain_txt}</div></details>
+  {errors_html}
+  {('<details><summary>Kimlik kayıtlarını incele</summary>' + creds_rows + '</details>') if creds_rows else ''}
+  </section>
 
+  <section class="panel" id="coverage" role="tabpanel" aria-labelledby="tab-coverage">
   <h2>Kontrol Kapsamı</h2>
   <p>{_esc(report.assessment_label())} · {_esc(report.scan_mode)}</p>
-  <table><thead><tr><th>Kontrol</th><th>Durum</th><th>Açıklama</th></tr></thead><tbody>
-  {''.join('<tr>' + ''.join('<td>' + _esc(str(c[k])) + '</td>' for k in ('control_id', 'status', 'reason')) + '</tr>' for c in report.coverage)}
-  </tbody></table>
+  <p id="coverage-count" aria-live="polite"></p>
+  <div class="table-scroll"><table><thead><tr><th>Modül</th><th>Kontrol</th><th>Kimlik</th>
+  <th>Hedef</th><th>Durum</th><th>Açıklama</th><th>Gözlem zamanı</th><th>Kaynak</th></tr></thead><tbody>
+  {coverage_rows}
+  </tbody></table></div>
+  </section>
+  <section class="panel" id="findings" role="tabpanel" aria-labelledby="tab-findings">
   <h2>Bulgular ({len(report.findings)})</h2>
+  <p id="result-count" aria-live="polite"></p>
   {''.join(rows) or '<p>Bulgu yok.</p>'}
-  {creds_rows}
-  {errors_html}
-</div></body></html>"""
+  <div class="pagination"><label>Sayfa başına <select id="page-size"><option>25</option><option>50</option><option>100</option></select></label>
+    <button id="page-prev" type="button">Önceki</button><span id="page-position" aria-live="polite"></span>
+    <button id="page-next" type="button">Sonraki</button></div>
+  </section>
+  <section class="panel" id="comparison" role="tabpanel" aria-labelledby="tab-comparison">
+  <h2>Test Kapsamı Karşılaştırması</h2>{comparison_html}</section>
+  <section class="panel" id="permissions" role="tabpanel" aria-labelledby="tab-permissions">
+  <h2>Etkin Yetki Analizi</h2>{permissions_html}</section>
+  <footer class="report-footer">ADSCAN · Kanıta dayalı değerlendirme · Çalıştırma başarısı zafiyet yokluğu anlamına gelmez.</footer>
+</div>{report_ui.SCRIPT}</body></html>"""
 
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(html)

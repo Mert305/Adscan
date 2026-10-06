@@ -142,6 +142,10 @@ def _parse_ldap_enum(results: list[CommandResult], report: ScanReport) -> None:
         (r.combined for r in results if r.tool.endswith("ldap-groups")), ""))
 
     users = _extract_ldap_names(users_out)
+    # Kimlikli LDAP bind yapıldıysa (çıktı geldiyse) görünen kullanıcı sayısını
+    # kaydet — SAMR sayısıyla kıyaslayıp confidential/gizleme ACL'ini yakalamak için.
+    if users_out.strip():
+        report.ldap_user_count = len(users)
     for u in users:
         if u not in report.users:
             report.users.append(u)
@@ -693,6 +697,8 @@ def parse_smb(results: list[CommandResult], report: ScanReport) -> None:
         (r.combined for r in results if r.tool.endswith("smb-rid-brute")), ""))
     rid_users = _parse_rid_brute(rid_out, report)
     if rid_users:
+        report.samr_user_count = len(rid_users)
+    if rid_users:
         report.add(Finding(
             title=f"RID brute ile {len(rid_users)} domain kullanıcısı enumere edildi — nxc",
             severity=Severity.MEDIUM,
@@ -832,6 +838,8 @@ def parse_smb(results: list[CommandResult], report: ScanReport) -> None:
                 "-> parola/konfig dosyaları, SYSVOL'de GPP (cpassword).",
             )
         )
+
+    _parse_nondefault_shares(shares_out, target, report)
 
     # Zayıf parola politikası
     m = re.search(r"Minimum password length:\s*(\d+)", combined, re.IGNORECASE)
@@ -1059,6 +1067,93 @@ def parse_ldap(results: list[CommandResult], report: ScanReport) -> None:
             )
         )
 
+    # Modern nxc banner biçimi: "(signing:Enforced) (channel binding:Never)".
+    # signing zorunlu OLSA BİLE channel binding Never/No ise LDAPS relay hâlâ
+    # mümkündür — bu nüans yukarıdaki "not required" kalıbına takılmaz, ayrı bas.
+    cb = re.search(r"channel binding:\s*(Never|No|Off|Disabled)", combined, re.IGNORECASE)
+    if cb and not re.search(r"channel binding[^\n]*\bnot\b", combined, re.IGNORECASE):
+        sign_enf = bool(re.search(r"signing:\s*(Enforced|Required|True)", combined,
+                                  re.IGNORECASE))
+        report.add(
+            Finding(
+                title="LDAP channel binding = Never — signing'e rağmen LDAP relay mümkün — nxc",
+                severity=Severity.HIGH,
+                target=target,
+                source="nxc-ldap",
+                control_id="ldap.channel-binding.never",
+                reference="LDAP Relay / EPA (CVE-2017-8563 sınıfı)",
+                mitre="T1557.001",
+                description="DC, LDAP için channel binding (EPA) ZORLAMIYOR. "
+                            + ("SMB/LDAP signing zorunlu olsa bile " if sign_enf else "")
+                            + "channel binding Never olduğundan, coercion ile zorlanan bir "
+                            "makine/DC auth'u ldaps://DC'ye relay edilerek RBCD/Shadow "
+                            "Credentials/ACL suistimaliyle domain ele geçirilebilir.",
+                evidence="\n".join(dict.fromkeys(
+                    _grep(combined, r"signing:.*channel binding:", context=0).splitlines())),
+                remediation="DC'de LDAP channel binding'i (LdapEnforceChannelBinding=2) ve "
+                            "LDAP signing'i zorunlu kılın; RPC coercion yüzeylerini kapatın.",
+                poc=f"nxc ldap {target}   # banner'da '(channel binding:Never)' görünür",
+                escalation="coerce (PetitPotam/printerbug/dfscoerce) + "
+                           "ntlmrelayx.py -t ldaps://<DC> --remove-mic --delegate-access "
+                           "(RBCD) ya da --shadow-credentials -> DC TGT -> DCSync (DA). "
+                           "Hazır akış: 'adscan --active-attacks --launch'.",
+            )
+        )
+
+
+_DEFAULT_SHARES = {"ADMIN$", "C$", "IPC$", "NETLOGON", "SYSVOL", "PRINT$"}
+_SHARE_LINE_RX = re.compile(
+    r"^SMB\s+\S+\s+\d+\s+\S+\s+(?P<name>\S[^\t]*?)\s+"
+    r"(?P<perm>READ(?:,WRITE)?|WRITE|READ_ONLY|)\s*(?P<remark>\S.*)?$")
+
+
+def _parse_nondefault_shares(shares_out: str, target: str, report: ScanReport) -> None:
+    """Varsayılan olmayan (özel) paylaşımları raporlar — ERİŞİLEMEYENLER dahil.
+
+    Varsayılan dışı bir paylaşımın VARLIĞI (ör. 'IT', 'Dev', 'Backup') içeride
+    ilginç veri olduğunu gösterir; erişim REDDEDİLMİŞSE bu, başka bir kimlikle
+    hedeflenecek bir yüzeydir — sadece okunabilir paylaşımları raporlamak bu
+    sinyali kaçırır.
+    """
+    readable: list[str] = []
+    denied: list[str] = []
+    for line in shares_out.splitlines():
+        m = _SHARE_LINE_RX.match(line.rstrip())
+        if not m:
+            continue
+        name = m.group("name").strip()
+        if not name or name.upper() in _DEFAULT_SHARES or name.lower() == "share":
+            continue
+        perm = (m.group("perm") or "").strip().upper()
+        if perm in ("READ", "WRITE", "READ,WRITE"):
+            readable.append(f"{name}  [{perm}]")
+        else:
+            denied.append(name)
+    if not readable and not denied:
+        return
+    ev = []
+    if readable:
+        ev.append("Erişilebilir özel paylaşım(lar):\n  " + "\n  ".join(readable))
+    if denied:
+        ev.append("Erişilemeyen (ama VAR) özel paylaşım(lar) — başka kimlikle hedef:\n  "
+                  + "\n  ".join(denied))
+    # Erişilemeyen özel paylaşım bir ipucu (hedef); erişilebilir olan ise veri sızıntısı.
+    sev = Severity.MEDIUM if readable else Severity.LOW
+    report.add(Finding(
+        title=f"Varsayılan olmayan SMB paylaşımı tespit edildi "
+              f"({len(readable)} erişilebilir, {len(denied)} erişilemez) — nxc",
+        severity=sev, target=target, source="nxc-smb",
+        control_id="smb.nondefault-share", mitre="T1135",
+        description="Standart AD paylaşımları (SYSVOL/NETLOGON/C$/ADMIN$/IPC$) dışında özel "
+                    "paylaşım(lar) var. Erişilebilenlerde doğrudan veri; erişilemeyenler ise "
+                    "doğru kimlikle ulaşılacak öncelikli hedeftir.",
+        evidence="\n".join(ev),
+        remediation="Özel paylaşımların ACL'lerini en az yetki ilkesine göre denetleyin.",
+        poc=f"nxc smb {target} -u <user> -p <pass> --shares   ;  "
+            f"nxc smb {target} -u <user> -p <pass> -M spider_plus",
+        escalation="Erişilebilir: 'spider_plus' ile parola/konfig avı. Erişilemez: hedef "
+                   "paylaşıma yetkili kullanıcıyı (BloodHound/group-mem) bul -> o kimlikle oku."))
+
 
 # netexec'in OLUMSUZ/banner satırları — bu satırlar bulgu ÜRETMEMELİ (FP guard).
 # "[-] No accounts found", "[*] Searching…", "0 results", "is not vulnerable" vb.
@@ -1210,6 +1305,10 @@ def vuln_scan(
         ("maq", ldap_base + ["-M", "maq"]),
         # pre2k: pre-created makine hesapları (parola = makine adı, küçük harf)
         ("pre2k", ldap_base + ["-M", "pre2k"]),
+        # MS17-010 (EternalBlue): nmap NSE'den BAĞIMSIZ çapraz-doğrulama (kimliksiz).
+        ("ms17-010", smb_base + ["-M", "ms17-010"]),
+        # GPP cpassword (MS14-025 / CVE-2014-1812): SYSVOL Groups.xml -> çözülmüş parola.
+        ("gpp-password", smb_base + ["-M", "gpp_password"]),
     ]
     # Sürüme bağlı/opsiyonel modüller (F: kurulu değilse çalıştırma — sessiz
     # başarısızlık/gürültü olmasın). Modül listesi tespit edilemezse yine denenir.
@@ -1391,6 +1490,8 @@ def parse_vuln(results: list[CommandResult], report: ScanReport) -> None:
     _parse_printnightmare(combined, report)
     _parse_smbghost(combined, report)
     _parse_sccm(combined, report)
+    _parse_ms17_010_nxc(combined, report)   # EternalBlue (nmap'ten bağımsız teyit)
+    _parse_gpp_password(results, report)    # GPP cpassword (MS14-025) -> kimlik
 
 
 # ---------------------------------------------------------------------------
@@ -1407,6 +1508,20 @@ def _parse_timeroast(combined: str, report: ScanReport) -> None:
     hashes = re.findall(r"\$sntp-ms\$\S+", combined)
     if not hashes:
         return
+    # Kırma fazı için loot/timeroast.txt'e "RID:$sntp-ms$..." biçiminde yaz
+    # (crack.py hashcat -m 31300 ile --username bayrağı kullanarak kırar).
+    rid_lines = re.findall(r"(\d+):(\$sntp-ms\$\S+)", combined)
+    try:
+        import os as _os
+        tpath = _loot_path(report.outdir, "timeroast.txt")
+        _os.makedirs(_os.path.dirname(tpath), exist_ok=True)
+        with open(tpath, "w", encoding="utf-8") as _fh:
+            if rid_lines:
+                _fh.write("\n".join(f"{rid}:{h}" for rid, h in rid_lines) + "\n")
+            else:
+                _fh.write("\n".join(hashes) + "\n")
+    except OSError:
+        pass
     report.add(Finding(
         title=f"Timeroasting: {len(hashes)} makine hesabı hash'i toplandı — nxc",
         severity=Severity.HIGH, target=target, source="nxc-vulns",
@@ -1483,6 +1598,80 @@ def _parse_smbghost(combined: str, report: ScanReport) -> None:
         reference="CVE-2020-0796 (SMBGhost/CoronaBlue)", mitre="T1210",
         poc=f"nxc smb {report.target} -M smbghost",
         escalation="(LAB) genel SMBGhost RCE PoC'si -> SYSTEM shell -> secretsdump -> yanal hareket."))
+
+
+def _parse_ms17_010_nxc(combined: str, report: ScanReport) -> None:
+    """MS17-010 (EternalBlue) — netexec -M ms17-010 ile bağımsız teyit.
+
+    nmap modülü de ayrı bir bulgu üretebilir; farklı kaynaklar (nmap/nxc) aynı
+    fingerprint'i paylaşmadığından ScanReport.add bunları ayrı tutar — çift
+    kaynak teyidi savunan için değerlidir. FP guard: _pos_vuln olumsuzlamayı eler.
+    """
+    line = _pos_vuln(combined, r"ms17-010|eternalblue", signal_rx=r"vulnerable")
+    if not line:
+        return
+    report.add(Finding(
+        title="MS17-010 (EternalBlue) ZAFİYETLİ — nxc",
+        severity=Severity.CRITICAL, target=report.target, source="nxc-vulns",
+        description="netexec, SMBv1'de MS17-010 (EternalBlue) uzaktan kod çalıştırma "
+                    "zafiyetini doğruladı — kimliksiz RCE.",
+        evidence=line,
+        remediation="MS17-010 güvenlik güncellemesini derhal uygulayın; SMBv1'i kapatın.",
+        reference="CVE-2017-0143 / MS17-010", mitre="T1210",
+        poc=f"nxc smb {report.target} -M ms17-010",
+        escalation="RCE (yalnızca LAB): AutoBlue/metasploit "
+                   "'exploit/windows/smb/ms17_010_eternalblue' -> SYSTEM -> secretsdump -> DA."))
+
+
+def _parse_gpp_password(results: list[CommandResult], report: ScanReport) -> None:
+    """GPP cpassword (MS14-025 / CVE-2014-1812): SYSVOL Groups.xml çözülmüş parola.
+
+    GPP cpassword'ü şifreleyen AES anahtarı Microsoft tarafından yayımlandığından
+    netexec `-M gpp_password` değeri otomatik ÇÖZER. Bulunan her kimlik rapora
+    eklenir. FP guard: olumsuz/banner satırları ve boş/placeholder değerler elenir.
+    """
+    out = strip_dryrun(next(
+        (r.combined for r in results if r.tool.endswith("gpp-password")), ""))
+    if not out or not re.search(r"pass(?:word)?s?\s*[:=]", out, re.IGNORECASE):
+        return
+
+    def _clean(tok: str) -> str:
+        return tok.strip().strip("[]'\" ").strip()
+
+    placeholders = {"none", "null", "not found", "[not found]", "empty", ""}
+    users = [_clean(u) for u in re.findall(
+        r"user(?:name)?s?\s*[:=]\s*([^\n]+)", out, re.IGNORECASE)]
+    pws = [_clean(p) for p in re.findall(
+        r"pass(?:word)?s?\s*[:=]\s*([^\n]+)", out, re.IGNORECASE)]
+    users = [u for u in users if u.lower() not in placeholders]
+    pws = [p for p in pws if p.lower() not in placeholders]
+    if not pws:
+        return
+
+    if len(users) == len(pws):
+        pairs = list(zip(users, pws, strict=True))
+    else:  # kullanıcı eşleşmese de çözülen parolaları kaybetme
+        pairs = [(users[i] if i < len(users) else "", p) for i, p in enumerate(pws)]
+
+    for u, p in pairs:
+        report.add_credential(Credential(
+            username=u or "(gpp)", secret=p, kind="password",
+            domain=report.domain or "", source="gpp-password"))
+    ev = "\n".join(f"{u or '?'}:{'<gizli>' if config.REDACT else p}" for u, p in pairs[:25])
+    report.add(Finding(
+        title=f"GPP cpassword kimlik(leri) ({len(pairs)}) — SYSVOL Groups.xml (MS14-025)",
+        severity=Severity.CRITICAL, target=report.target, source="nxc-vulns",
+        description="SYSVOL'deki Group Policy Preferences (Groups.xml / Services.xml / "
+                    "ScheduledTasks.xml) dosyalarında 'cpassword' alanı bulundu. Şifreleme "
+                    "anahtarı herkese açık olduğundan parola geri çözülür; tüm kimlikli "
+                    "kullanıcılarca okunabilen, doğrudan kullanılabilir bir kimliktir.",
+        evidence=ev,
+        remediation="GPP cpassword içeren XML'leri SYSVOL'den kaldırın (MS14-025 yaması bunu "
+                    "engeller); sızan hesapların parolalarını döndürün.",
+        reference="CVE-2014-1812 / MS14-025 (GPP cpassword)", mitre="T1552.006",
+        poc=f"nxc smb {report.target} -u <user> -p <pass> -M gpp_password",
+        escalation=f"Çözülen kimliği doğrudan dene: 'adscan {report.target} --reuse "
+                   "-u <user> -p <parola>' -> yanal hareket / privesc."))
 
 
 def _parse_sccm(combined: str, report: ScanReport) -> None:
@@ -1598,7 +1787,7 @@ LDAP_MODULE = ScanModule(
 VULN_MODULE = ScanModule(
     name="nxc-vulns",
     label="netexec aktif zafiyet kontrolleri (zerologon/coerce_plus/maq/pre2k/"
-          "printnightmare/smbghost/sccm)",
+          "ms17-010/gpp_password/printnightmare/smbghost/sccm)",
     run=_vuln_run,
     parse=parse_vuln,
 )

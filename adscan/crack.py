@@ -36,11 +36,14 @@ WORDLIST_CANDIDATES = [
 #   19600 = Kerberoast TGS-REP AES128   (etype 17)
 #   19700 = Kerberoast TGS-REP AES256   (etype 18)
 #   18200 = AS-REP RC4                  (etype 23)
+#   31300 = Timeroast MS-SNTP (makine hesabı)
 _TGS_MODE = {"23": "13100", "17": "19600", "18": "19700"}
 _ASREP_MODE = {"23": "18200", "17": "19600", "18": "19700"}
 
 _RX_TGS = re.compile(r"\$krb5tgs\$(\d+)\$\*([^$*]+)\$", re.IGNORECASE)
 _RX_ASREP = re.compile(r"\$krb5asrep\$(?:(\d+)\$)?([^@$:]+)@", re.IGNORECASE)
+# Timeroast: nxc biçimi "RID:$sntp-ms$<hash>$<salt>" (RID = makine hesabı tanıtıcısı)
+_RX_SNTP = re.compile(r"^(?:(\d+):)?\$sntp-ms\$", re.IGNORECASE)
 
 
 def default_wordlist() -> str | None:
@@ -62,6 +65,10 @@ def _hash_meta(line: str) -> tuple[str | None, str | None]:
     if m:
         etype, user = m.group(1) or "23", m.group(2)
         return _ASREP_MODE.get(etype, "18200"), user
+    m = _RX_SNTP.match(line)
+    if m:
+        rid = m.group(1)
+        return "31300", (f"makine-RID-{rid}" if rid else "makine-hesabı")
     return None, None
 
 
@@ -76,7 +83,7 @@ def _read_hashes(paths: list[str]) -> list[str]:
             with open(p, encoding="utf-8", errors="replace") as fh:
                 for raw in fh:
                     ln = raw.strip()
-                    if ln.startswith("$krb5") and ln not in seen:
+                    if (ln.startswith("$krb5") or "$sntp-ms$" in ln) and ln not in seen:
                         seen.add(ln)
                         out.append(ln)
         except OSError:
@@ -100,6 +107,10 @@ def _run_hashcat(bin_name: str, mode: str, hashes: list[str], wordlist: str,
         fh.write("\n".join(hashes) + "\n")
 
     common = [bin_name, "-m", mode, "--potfile-path", potfile, "--quiet"]
+    # Timeroast (31300) satırları "RID:$sntp-ms$..." biçiminde; --username ile
+    # hashcat ':' öncesini (RID) yok sayar. krb5 hash'lerinde kullanılmaz.
+    if mode == "31300":
+        common.append("--username")
     # Kırma turu: -a 0 düz sözlük; --runtime ile kendini sınırla (kesintisiz).
     run(common + ["-a", "0", "--runtime", str(timeout), infile, wordlist],
         tool=f"crack:hashcat:{mode}", timeout=timeout + 60, dry_run=dry_run)
@@ -155,7 +166,8 @@ def crack_hashes(report: ScanReport, *, wordlist: str | None = None,
     bulgu üretilir. Araç/sözlük/h‌ash yoksa sessizce boş döner.
     """
     loot = os.path.join(report.outdir, "loot")
-    paths = [os.path.join(loot, "kerb.txt"), os.path.join(loot, "asrep.txt")]
+    paths = [os.path.join(loot, "kerb.txt"), os.path.join(loot, "asrep.txt"),
+             os.path.join(loot, "timeroast.txt")]
     if extra_files:
         paths += extra_files
     hashes = _read_hashes(paths)

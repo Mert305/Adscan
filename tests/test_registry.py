@@ -13,9 +13,10 @@ from adscan.registry import (
 
 def test_all_modules_names():
     names = {m.name for m in all_modules()}
-    assert names == {"nmap", "nxc-smb", "nxc-ldap", "nxc-vulns", "smbmap",
-                     "windapsearch", "certipy", "bloodyad", "bloodyad-enum",
-                     "bloodhound", "mssql", "winrm", "spray", "relay", "reuse"}
+    assert names == {"nmap", "web", "dns", "nxc-smb", "nxc-ldap", "nxc-vulns",
+                     "smbmap", "windapsearch", "certipy", "bloodyad", "bloodyad-enum",
+                     "bloodhound", "mssql", "gmsa", "access", "delegation", "gpo",
+                     "tickets", "winrm", "shadow", "userenum", "spray", "relay", "reuse"}
 
 
 def test_select_none_returns_only_passive():

@@ -1,7 +1,7 @@
 """Canlı terminal arayüzü — çok-satırlı dashboard.
 
 Ekranın altında yerinde güncellenen kalıcı bir **durum paneli** çizer; üstünde
-akan olay günlüğü kayar. Panel üç satırdır:
+akan olay günlüğü kayar. Panel terminal boyutuna göre 1–8 satırdır:
 
     1) spinner + ilerleme çubuğu + geçen süre + çalışan modüller
     2) canlı bulgu sayacı (seviyeye göre) + ele geçen kimlik + Domain Admin
@@ -9,10 +9,10 @@ akan olay günlüğü kayar. Panel üç satırdır:
 
 Paralel modüllerin hepsi tek terminale yazdığından her çıktı tek kilitten
 (RLock) geçer; böylece panel ile log satırları birbirine karışmaz. Panel
-yüksekliği sabittir (daralma/büyüme titremesi olmaz); her kare satır-satır
+yüksekliği terminal boyutuna uyum sağlar; her kare satır-satır
 `\\033[2K` ile temizlenip yeniden yazılır.
 
-TTY değilse (boru/dosya/NO_COLOR) panel kapanır ve `log()` düz `print`e düşer —
+TTY değilse veya plain seçilmişse panel kapanır ve `log()` düz `print`e düşer —
 çıktı otomasyon/log dosyalarında temiz kalır.
 """
 
@@ -20,11 +20,13 @@ from __future__ import annotations
 
 import itertools
 import os
-import re
 import shutil
 import sys
 import threading
 import time
+
+from . import config
+from .terminal import clean, fit
 
 _SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _RESET = "\033[0m"
@@ -36,7 +38,6 @@ _CYAN = "\033[38;5;44m"  # dolu çubuk / marka
 _BRAND2 = "\033[38;5;39m"  # mavi aksan
 _SPINC = "\033[38;5;39m"  # spinner
 _GREEN = "\033[38;5;42m"
-_ANSI_RX = re.compile(r"\033\[[0-9;]*m")
 
 # Seviye renkleri + ikonları (report.py ile uyumlu)
 _SEV = {
@@ -51,31 +52,7 @@ _DA_HOT = "\033[1;97;41m"  # Domain Admin: beyaz/kırmızı zemin
 
 def _fit(text: str, width: int) -> str:
     """ANSI kodlarını koruyarak metni görünür `width` karaktere kırpar."""
-    if width <= 0:
-        return ""
-    out: list[str] = []
-    vis = 0
-    i = 0
-    n = len(text)
-    truncated = False
-    while i < n:
-        ch = text[i]
-        if ch == "\033":
-            m = _ANSI_RX.match(text, i)
-            if m:
-                out.append(m.group())
-                i = m.end()
-                continue
-        if vis >= width:
-            truncated = True
-            break
-        out.append(ch)
-        vis += 1
-        i += 1
-    res = "".join(out)
-    if truncated:
-        res += _RESET
-    return res
+    return fit(text, width)
 
 
 class Live:
@@ -89,13 +66,16 @@ class Live:
         self._running: set[str] = set()
         self._started: dict[str, float] = {}
         self._detail = ""
+        self._modules: dict[str, str] = {}
+        self._coverage: list[dict] = []
+        self._observations: dict[tuple, dict] = {}
         self._lock = threading.RLock()
         self._spin = itertools.cycle(_SPIN)
         self._frame = next(self._spin)
         self._t0 = time.time()
         tty = sys.stdout.isatty()
-        self.enabled = tty if enabled is None else (enabled and tty)
-        self.color = tty and not os.environ.get("NO_COLOR")
+        self.enabled = (tty if enabled is None else (enabled and tty)) and config.TERMINAL_UI != "plain"
+        self.color = tty and not os.environ.get("NO_COLOR") and config.TERMINAL_UI != "plain"
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._drawn = 0  # panelin o an kapladığı fiziksel satır sayısı
@@ -109,13 +89,16 @@ class Live:
     def _panel_height(self) -> int:
         """Terminal ölçüsüne göre panel yüksekliği (3 tam, 1 dar/kısa)."""
         size = shutil.get_terminal_size((80, 20))
-        if size.columns < 54 or size.lines < 8:
+        if size.columns < 40 or size.lines < 8:
             return 1
-        return 3
+        if size.columns < 72 or size.lines < 14:
+            return 3
+        return min(8, size.lines - 6)
 
     # ------------------------------------------------------------------ yaşam döngüsü
     def start(self) -> Live:
         if self.enabled:
+            sys.stdout.write("\033[?25l")
             self._thread = threading.Thread(target=self._animate, daemon=True)
             self._thread.start()
         return self
@@ -127,6 +110,9 @@ class Live:
         with self._lock:
             if self.enabled and self._drawn:
                 self._erase()
+            if self.enabled:
+                sys.stdout.write("\033[?25h")
+                sys.stdout.flush()
 
     def __enter__(self) -> Live:
         return self.start()
@@ -139,9 +125,45 @@ class Live:
         with self._lock:
             if running:
                 self._running.add(label)
+                self._modules[label] = "çalışıyor"
                 self._started.setdefault(label, time.time())
             else:
                 self._running.discard(label)
+                self._modules[label] = "ayrıştırılıyor"
+
+    def register_modules(self, names) -> None:
+        with self._lock:
+            self._modules.update(dict.fromkeys(names, "bekliyor"))
+
+    def finish_module(self, name: str, status: str) -> None:
+        with self._lock:
+            self._running.discard(name)
+            self._modules[name] = status
+
+    def set_coverage(self, rows) -> None:
+        with self._lock:
+            self._coverage = [dict(row) for row in rows if row.get("level") == "control"]
+
+    def observe_control(self, row) -> None:
+        with self._lock:
+            self._observations[(row["module"], row["control_id"])] = dict(row)
+
+    def _coverage_str(self) -> str:
+        merged = dict(self._observations)
+        for row in self._coverage:
+            merged.pop(("", row["control_id"]), None)
+            key = (row["module"], row["control_id"])
+            # Planned rows do not overwrite an observation received during execution.
+            if row["status"] != "planned" or key not in merged:
+                merged[key] = row
+        rows = list(merged.values())
+        completed = sum(r["status"] in {"completed", "findings"} for r in rows)
+        denied = sum(r["status"] == "access_denied" for r in rows)
+        failed = sum(r["status"] == "failed" for r in rows)
+        other = len(rows) - completed - denied - failed
+        cached = sum(bool(r.get("resumed")) for r in rows)
+        return (f"Kontrol: tamam {completed} · erişim yok {denied} · hata {failed} "
+                f"· diğer {other} · checkpoint {cached}")
 
     def elapsed(self, label: str) -> float:
         """Modülün başlamasından bu yana geçen süre (sn)."""
@@ -149,7 +171,7 @@ class Live:
 
     def set_detail(self, text: str) -> None:
         with self._lock:
-            self._detail = text
+            self._detail = clean(text).replace("\n", " ")
 
     def advance(self, n: int = 1) -> None:
         with self._lock:
@@ -170,7 +192,7 @@ class Live:
         with self._lock:
             if self.enabled and self._drawn:
                 self._erase()
-            print(text)
+            print(text if self.color else clean(text))
             if self.enabled:
                 self._render()
 
@@ -198,9 +220,8 @@ class Live:
         if not self.enabled:
             return
         lines = self._compose()
+        self._erase()
         buf: list[str] = ["\r"]
-        if self._drawn > 1:
-            buf.append(f"\033[{self._drawn - 1}A")
         for i, ln in enumerate(lines):
             buf.append(_CLEAR)
             buf.append(ln)
@@ -253,7 +274,7 @@ class Live:
 
     def _compose(self) -> list[str]:
         width = shutil.get_terminal_size((80, 20)).columns
-        inner = max(10, width - 2)
+        self._height = self._panel_height()
         acc = self._c(_CYAN, "┃")
         spin = self._c(_SPINC, self._frame)
 
@@ -287,4 +308,15 @@ class Live:
         detail_s = f"  {self._c(_DIM, '· ' + detail)}" if detail else ""
         l3 = f"{acc}   {chain}{detail_s}"
 
-        return [_fit(l1, inner + 1), _fit(l2, inner + 1), _fit(l3, inner + 1)]
+        if self._height == 3:
+            return [_fit(l1, width - 1), _fit(l2, width - 1),
+                    _fit(self._coverage_str(), width - 1)]
+        lines = [l1, l2, f"{acc} {self._coverage_str()}"]
+        remaining = sum(v == "bekliyor" for v in self._modules.values())
+        lines.append(f"{acc} Modüller · kuyruk {remaining} · çalışan {len(self._running)}")
+        ordered = sorted(self._modules, key=lambda n: (n not in self._running, self._modules[n] == "bekliyor", n))
+        for name in ordered[:max(0, self._height - 5)]:
+            elapsed = f" · {self.elapsed(name):.0f}s" if name in self._running else ""
+            lines.append(f"{acc}   {name:<20} {self._modules[name]}{elapsed}")
+        lines.append(l3)
+        return [_fit(line, width - 1) for line in lines]

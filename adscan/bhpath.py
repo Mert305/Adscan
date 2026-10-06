@@ -243,6 +243,85 @@ def format_path(g: Graph, path: list[tuple[str, Edge]]) -> str:
     return out
 
 
+def first_degree_control(g: Graph, controlled: set[str]) -> list[tuple[str, str, str]]:
+    """Kontrol edilen principal'(lar)ın DOĞRUDAN (1 adım) ele geçirebildiği hedefler.
+
+    DA'ya tam yol olmasa bile "elimdeki kimlik neyi kontrol ediyor" sorusunu
+    yanıtlar — BloodHound GUI'deki 'First Degree Object Control' gibi. Grup
+    üyeliklerini de izleyerek (devralınan haklar) etkin kontrolü bulur.
+    """
+    # Üyelik kapanışı: kontrol edilen + üyesi olunan tüm gruplar
+    reach = set(controlled)
+    queue = deque(controlled)
+    while queue:
+        node = queue.popleft()
+        for e in g.edges.get(node, []):
+            if e.right == "MemberOf" and e.dst not in reach:
+                reach.add(e.dst)
+                queue.append(e.dst)
+    rights = _TAKEOVER | _ADDMEMBER | {"AllowedToAct"} | _DCSYNC
+    out: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for sid in reach:
+        for e in g.edges.get(sid, []):
+            if e.right in rights and (e.right, e.dst) not in seen:
+                seen.add((e.right, e.dst))
+                dst = g.nodes.get(e.dst, {})
+                out.append((e.right, dst.get("name", e.dst), dst.get("type", "?")))
+    return out
+
+
+# DCSync/domain-kök haklarına sahip olması NORMAL olan principal adları.
+_DEFAULT_DCSYNC = (
+    "DOMAIN ADMINS@", "ENTERPRISE ADMINS@", "ADMINISTRATORS@", "DOMAIN CONTROLLERS@",
+    "ENTERPRISE DOMAIN CONTROLLERS@", "SYSTEM@", "NT AUTHORITY", "ENTERPRISE KEY ADMINS@",
+    "KEY ADMINS@",
+)
+
+
+def detect_persistence(g: Graph, report: ScanReport) -> None:
+    """DACL backdoor / persistence göstergeleri: varsayılan OLMAYAN bir principal'a
+    verilmiş DCSync ya da domain kökü üzerinde yazma (GenericAll/WriteDacl/Owner).
+
+    Bu, bir saldırganın ya da yanlış yapılandırmanın bıraktığı kalıcı domain-ele
+    geçirme hakkıdır — düşük yetkili kullanıcı istediği an DCSync yapabilir.
+    """
+    hits: list[str] = []
+    domain_sids = {sid for sid, n in g.nodes.items() if n.get("type") == "Domain"}
+    control = _TAKEOVER | _DCSYNC
+    for src, edges in g.edges.items():
+        sname = g.nodes.get(src, {}).get("name", src)
+        up = sname.upper()
+        if any(up.startswith(p) or p in up for p in _DEFAULT_DCSYNC):
+            continue
+        if up.endswith("$") or g.nodes.get(src, {}).get("type") == "Computer":
+            continue  # makine hesapları (DC$ vb.) — ayrı değerlendir
+        for e in edges:
+            if e.dst in domain_sids and e.right in control:
+                label = "DCSync" if e.right in _DCSYNC else e.right
+                hits.append(f"{sname}  --[{label}]-->  {g.nodes.get(e.dst, {}).get('name', e.dst)}")
+    if not hits:
+        return
+    report.add(Finding(
+        title=f"DACL persistence/backdoor: {len(hits)} varsayılan-dışı principal domain "
+              "kökünde yüksek hak taşıyor",
+        severity=Severity.HIGH, target=report.target, source="bhpath",
+        control_id="bhpath.dacl-persistence", mitre="T1098",
+        reference="DCSync rights / AdminSDHolder DACL backdoor",
+        description="Domain kökünde (ya da DCSync) beklenmedik principal'lara verilmiş "
+                    "kontrol hakkı. DCSync = istenildiğinde krbtgt dahil tüm hash'leri "
+                    "dökme yetkisi; genelde kalıcılık (persistence) ya da ciddi yanlış "
+                    "yapılandırma işaretidir.",
+        evidence="\n".join(sorted(set(hits))[:40]),
+        remediation="Bu ACE'leri domain nesnesinden ve AdminSDHolder'dan kaldırın; "
+                    "DCSync (GetChanges/GetChangesAll) yalnız DC'lerde olmalı. krbtgt'yi "
+                    "iki kez sıfırlamayı değerlendirin.",
+        poc="BloodHound: 'Dangerous Rights for Domain Users' / domain nesnesi ACL'i; "
+            "bloodyAD get object <domain> --attr nTSecurityDescriptor",
+        escalation="Varsayılan-dışı DCSync: secretsdump.py <dom>/<user>@<dc> -just-dc "
+                   "(krbtgt -> Golden Ticket). Kaldırmadan önce kalıcılık olup olmadığını araştır."))
+
+
 def analyze(report: ScanReport, *, ui=None) -> list[tuple[str, Edge]] | None:
     """BloodHound grafiğinden DA'ya yolu bulur ve raporlar (veri yoksa sessiz)."""
     if any(f.source == "bhpath" for f in report.findings):
@@ -251,11 +330,32 @@ def analyze(report: ScanReport, *, ui=None) -> list[tuple[str, Edge]] | None:
     if not g.nodes:
         return None  # toplanan veri yok / okunamadı
 
+    detect_persistence(g, report)
+
     controlled = _controlled_sids(report, g)
     if not controlled:
         if ui is not None:
             ui.log("  (bhpath: kontrol edilen kimlik grafikte eşleşmedi)")
         return None
+
+    # Birinci-derece kontrol (DA yolu olsun olmasın her zaman değerli)
+    fd = first_degree_control(g, controlled)
+    if fd:
+        ev = "\n".join(f"{r}  ->  [{t}] {n}" for r, n, t in fd[:40])
+        report.add(Finding(
+            title=f"Owned kimlik birinci-derece kontrol: {len(fd)} nesne doğrudan ele geçirilebilir",
+            severity=Severity.HIGH, target=report.target, source="bhpath",
+            control_id="bhpath.first-degree", mitre="T1098",
+            description="Kontrol edilen kimlik(ler) (grup üyelikleri dahil) aşağıdaki AD "
+                        "nesnelerini TEK adımda ele geçirebilir/değiştirebilir. Bunlar yanal "
+                        "hareket ve yükseltme için ilk hedeflerdir.",
+            evidence=ev,
+            remediation="Bu ACL/üyelik haklarını en az yetki ilkesine göre kaldırın.",
+            reference="BloodHound first-degree object control",
+            poc="bloodhound-python -c all --zip  # sonra adscan kenarları çıkarır",
+            escalation="AddKeyCredentialLink -> 'certipy shadow auto -account <hedef>' (NT hash); "
+                       "GenericAll/Write (user) -> parola sıfırla / targeted kerberoast; "
+                       "(group) -> kendini ekle; (computer) -> RBCD. adscan --shadow/--bloodyad."))
 
     path = shortest_path(g, controlled)
     hv_total = sum(1 for n in g.nodes.values() if n.get("hv"))

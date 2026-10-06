@@ -79,6 +79,7 @@ class Finding:
     remediation: str = ""
     reference: str = ""  # CVE / teknik adı
     poc: str = ""  # kullanıcının bulguyu DOĞRULAYABİLECEĞİ komut
+    command: str = ""  # adscan'in bu bulguyu ÜRETİRKEN çalıştırdığı gerçek komut(lar)
     escalation: str = ""  # bu bulgudan ne çıkabilir / nasıl yükseltilir
     mitre: str = ""  # MITRE ATT&CK teknik id(leri), ör. "T1558.003"
     control_id: str = ""
@@ -109,6 +110,7 @@ class Finding:
             "remediation": self.remediation,
             "reference": self.reference,
             "poc": self.poc,
+            "command": self.command,
             "escalation": self.escalation,
             "mitre": self.mitre,
             "fingerprint": self.fingerprint,
@@ -139,6 +141,14 @@ class ScanReport:
     sessions: dict = field(default_factory=dict)  # host -> [oturum açmış kullanıcılar] (korelasyon)
     coverage: list[dict] = field(default_factory=list)
     scan_mode: str = "unspecified"
+    execution_context: dict = field(default_factory=dict)
+    comparison: dict = field(default_factory=dict)
+    effective_rights: list[dict] = field(default_factory=list)
+    # Kullanıcı sayımı kaynak kırılımı (LDAP gizleme/confidential tespiti için):
+    # SAMR rid-brute LDAP okumasını atlar; iki sayı belirgin ayrışırsa LDAP ACL'i
+    # nesneleri gizliyor demektir. -1 = o kaynak çalışmadı/ölçülmedi.
+    samr_user_count: int = -1
+    ldap_user_count: int = -1
 
     def add(self, finding: Finding) -> None:
         # Only collapse identical observations, never different evidence or objects.
@@ -149,9 +159,21 @@ class ScanReport:
         self.findings.append(finding)
 
     def record_coverage(self, control_id: str, status: str, reason: str = "",
-                        *, module: str = "") -> None:
-        self.coverage.append({"control_id": control_id, "module": module or control_id,
-                              "target": self.target, "status": status, "reason": reason})
+                        *, module: str = "", level: str = "control",
+                        observed_at: str = "", resumed: bool = False, label: str = "") -> None:
+        from .assessment import LABELS
+
+        entry = {"control_id": control_id, "module": module or control_id,
+                 "target": self.target, "status": status, "reason": reason,
+                 "label": label or LABELS.get(control_id, control_id), "level": level,
+                 "observed_at": observed_at or datetime.now(timezone.utc).isoformat(),
+                 "resumed": resumed}
+        for i, old in enumerate(self.coverage):
+            if (old["control_id"], old["module"], old.get("level", "control")) == (
+                    control_id, module or control_id, level):
+                self.coverage[i] = entry
+                return
+        self.coverage.append(entry)
 
     @property
     def assessment_complete(self) -> bool:
@@ -264,6 +286,9 @@ class ScanReport:
             "target": self.target,
             "schema_version": 2,
             "scan_mode": self.scan_mode,
+            "execution_context": self.execution_context,
+            "comparison": self.comparison,
+            "effective_rights": self.effective_rights,
             "assessment_complete": self.assessment_complete,
             "coverage": self.coverage,
             "domain": self.domain,

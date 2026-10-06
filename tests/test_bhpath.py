@@ -37,7 +37,9 @@ def test_bhpath_multihop_to_domain_admins(tmp_path):
     r.add_credential(Credential(username="alice", secret="Pw1", domain="corp.local"))
     path = bhpath.analyze(r)
     assert path is not None and len(path) == 2
-    f = next(f for f in r.findings if f.source == "bhpath")
+    # En kısa-yol bulgusu (first-degree bulgusundan ayrı): referansla seç
+    f = next(f for f in r.findings
+             if f.source == "bhpath" and "shortest-path" in f.reference)
     assert "GenericAll" in f.evidence and "MemberOf" in f.evidence
     assert "DOMAIN ADMINS" in f.evidence
 
@@ -54,7 +56,9 @@ def test_bhpath_dcsync_edge(tmp_path):
     r.add_credential(Credential(username="alice", secret="Pw1"))
     path = bhpath.analyze(r)
     assert path is not None
-    assert "GetChangesAll" in r.findings[0].evidence
+    # DCSync kenarı hem persistence hem yol bulgusunda görünebilir; birinde yeterli
+    assert any("GetChangesAll" in f.evidence or "DCSync" in f.evidence
+               for f in r.findings if f.source == "bhpath")
 
 
 def test_bhpath_no_data_is_silent(tmp_path):
@@ -75,8 +79,10 @@ def test_bhpath_idempotent(tmp_path):
     r = ScanReport(target="10.0.0.1", domain="corp.local", outdir=str(tmp_path))
     r.add_credential(Credential(username="alice", secret="Pw1"))
     bhpath.analyze(r)
-    bhpath.analyze(r)  # ikinci çağrı yeni bulgu EKLEMEMELİ
-    assert sum(1 for f in r.findings if f.source == "bhpath") == 1
+    n = sum(1 for f in r.findings if f.source == "bhpath")
+    bhpath.analyze(r)  # ikinci çağrı yeni bulgu EKLEMEMELİ (idempotent)
+    assert n >= 1
+    assert sum(1 for f in r.findings if f.source == "bhpath") == n
 
 
 def test_bhpath_graph_export_integration(tmp_path):

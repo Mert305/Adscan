@@ -19,7 +19,7 @@ import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Windows konsolunda (cp1254 vb.) Unicode karakterler için UTF-8'e geç
 for _stream in (sys.stdout, sys.stderr):
@@ -54,7 +54,7 @@ from .assessment import record_results
 from .findings import Credential, Finding, ScanReport, Severity
 from .modules import nxc_scan, spray_scan, windap_scan
 from .registry import ScanContext, get_module, noise_of, plan_modules, select_modules
-from .runner import resolve_tool
+from .runner import impacket_status, resolve_tool
 
 CONSENT_TEXT = (
     "Bu araç aktif tarama yapar. Yalnızca sahibi olduğunuz ya da YAZILI izniniz "
@@ -83,6 +83,12 @@ def tool_check() -> None:
         ("certipy (ADCS)", certipy_scan.tool()),
         ("bloodyAD (ACL privesc)", bloodyAD_scan.tool()),
         ("bloodhound-python", resolve_tool(bloodhound_scan.BH_PY_CANDIDATES)),
+        ("kerbrute (userenum/spray)", resolve_tool(["kerbrute"])),
+        ("impacket (relay/secretsdump)", impacket_status()),
+        ("pygpoabuse (GPO abuse)", resolve_tool(["pygpoabuse", "pygpoabuse.py"])),
+        ("mitm6 (IPv6 poisoning)", resolve_tool(["mitm6"])),
+        ("responder (LLMNR/NBT-NS)", resolve_tool(["responder", "Responder"])),
+        ("proxychains (pivot)", resolve_tool(["proxychains4", "proxychains"])),
         ("hashcat (kırma)", resolve_tool(["hashcat"])),
         ("john (kırma, yedek)", resolve_tool(["john"])),
     ]
@@ -317,9 +323,12 @@ _MODULE_PHASE = {
 def _make_sink(ui: live_ui.Live):
     """progress olaylarını canlı UI'a bağlar."""
     def sink(kind: str, module: str, text: str) -> None:
-        if kind == "cmd":
+        if kind == "control":
+            ui.observe_control(json.loads(text))
+        elif kind == "cmd":
             # Çalışan komut: alttaki barda geçici olarak göster (günlüğü boğmamak için).
-            ui.set_detail(text if len(text) < 60 else text[:59] + "…")
+            from .assessment import LABELS
+            ui.set_detail(text if config.TERMINAL_UI == "detailed" else LABELS.get(module, module))
         elif kind == "start":
             ui.log(f"  {_c('▸', 'dim', ui.color)} {text}")
         elif kind == "info":
@@ -330,6 +339,7 @@ def _make_sink(ui: live_ui.Live):
 def _push_stats(ui: live_ui.Live, report: ScanReport) -> None:
     """Rapordaki güncel bulgu/kimlik/DA/zincir durumunu canlı panele yansıtır."""
     counts = report.count_by_severity()
+    ui.set_coverage(report.coverage)
     try:
         rows = chaining.evaluate(report)
         chain_done = sum(1 for _, ok in rows if ok)
@@ -565,9 +575,33 @@ def _worker(mod, ctx, ui: live_ui.Live):
     if phase:
         progress.emit("info", mod.name, phase)
     try:
+        if ctx.checkpoint:
+            with ctx.checkpoint.module(mod.name, not mod.active and not ctx.use_kerberos):
+                return mod.run(ctx)
         return mod.run(ctx)
     finally:
         ui.set_running(mod.name, False)
+
+
+def _attach_commands(results, report, n0: int) -> None:
+    """Modülün çalıştırdığı gerçek komut(lar)ı, o modülün YENİ bulgularına iliştirir.
+
+    Her modül `run()` sırasında bir veya daha çok `CommandResult` üretir; bunların
+    `safe_cmd` (gerekirse maskeli) dizgesi, bulguyu DOĞRULAMA PoC'sinden farklı
+    olarak adscan'in gerçekte çalıştırdığı komuttur. Bulguyu açıkça komut
+    belirten (ör. nxc-db gibi sentetik) bulgular ezilmez.
+    """
+    cmds: list[str] = []
+    for r in results or []:
+        sc = getattr(r, "safe_cmd", "")
+        if sc:
+            cmds.append(sc)
+    if not cmds:
+        return
+    joined = "\n".join(dict.fromkeys(cmds))  # sırayı koru, tekrarları ele
+    for f in report.findings[n0:]:
+        if not f.command:
+            f.command = joined
 
 
 def _finish_module(ui: live_ui.Live, mod, results, report) -> None:
@@ -579,8 +613,17 @@ def _finish_module(ui: live_ui.Live, mod, results, report) -> None:
     except Exception as exc:  # ayrıştırma çökse de tarama sürsün
         parse_failed = True
         report.add_error(f"{mod.name}: ayrıştırma hatası: {exc}")
+        if getattr(report, "checkpoint", None):
+            report.checkpoint.invalidate(mod.name)
     record_results(report, mod.name, results, parse_failed=parse_failed,
                    findings=len(report.findings) > n0)
+    incomplete = any(c["module"] == mod.name and c["status"] not in
+                     {"completed", "findings", "not_applicable"} for c in report.coverage)
+    ui.finish_module(mod.name, "hata" if parse_failed else "kısmi" if incomplete else "tamamlandı")
+    if mod.name == "bloodyad" and not parse_failed:
+        from .permissions import record_tool_results
+        record_tool_results(results, report)
+    _attach_commands(results, report, n0)  # her yeni bulguya onu üreten komutu iliştir
     pocfill.fill(report)  # PoC'lerdeki <user>/<pass>'i bilinen kimlikle doldur
     ui.advance()
     _push_stats(ui, report)
@@ -611,7 +654,10 @@ def _finish_module(ui: live_ui.Live, mod, results, report) -> None:
 
 def _run_modules_live(modules, ctx, report, jobs: int) -> None:
     """Modülleri (paralel ya da sıralı) canlı UI ile çalıştırır."""
-    ui = live_ui.Live(total=len(modules)).start()
+    ui = live_ui.Live(total=len(modules), title=f"adscan · {report.target}")
+    ui.register_modules(mod.name for mod in modules)
+    _push_stats(ui, report)
+    ui.start()
     progress.set_sink(_make_sink(ui))
     try:
         if jobs == 1 or len(modules) == 1:
@@ -620,8 +666,11 @@ def _run_modules_live(modules, ctx, report, jobs: int) -> None:
                     results = _worker(mod, ctx, ui)
                 except Exception as exc:
                     report.add_error(f"{mod.name}: beklenmeyen hata: {exc}")
-                    report.record_coverage(mod.name, "failed", "Modül çalıştırılamadı")
+                    record_results(report, mod.name, [], parse_failed=True)
+                    ui.finish_module(mod.name, "hata")
+                    _push_stats(ui, report)
                     ui.advance()
+                    ui.log(f"  {mod.label} — HATA: {exc}")
                     continue
                 _finish_module(ui, mod, results, report)
         else:
@@ -633,7 +682,9 @@ def _run_modules_live(modules, ctx, report, jobs: int) -> None:
                         res = fut.result()
                     except Exception as exc:  # modül çökse de diğerleri sürsün
                         report.add_error(f"{mod.name}: beklenmeyen hata: {exc}")
-                        report.record_coverage(mod.name, "failed", "Modül çalıştırılamadı")
+                        record_results(report, mod.name, [], parse_failed=True)
+                        ui.finish_module(mod.name, "hata")
+                        _push_stats(ui, report)
                         ui.advance()
                         ui.log(f"  {_c('✘', 'red', ui.color)} {mod.label} — HATA: {exc}")
                         continue
@@ -753,6 +804,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     from . import __version__
     p.add_argument("--version", action="version", version=f"adscan {__version__}")
+    p.add_argument("--terminal-ui", choices=("compact", "detailed", "plain"), default="compact",
+                   help="Terminal görünümü: kısa kartlar, ayrıntılı veya animasyonsuz düz metin")
+    p.add_argument("--terminal-preview", action="store_true", help="Ağa bağlanmadan örnek terminal görünümü")
     p.add_argument("target", nargs="?", help="Hedef IP / CIDR / hostname (DC)")
     p.add_argument("-u", "--username", help="AD kullanıcı adı (opsiyonel)")
     p.add_argument("-p", "--password", help="AD parolası (opsiyonel)")
@@ -828,6 +882,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Kerberos auth kullan (nxc -k). ccache/KRB5CCNAME ve DC FQDN gerektirir.",
     )
     p.add_argument(
+        "--proxychains",
+        action="store_true",
+        help="Ağa dönük tüm komutları 'proxychains -q' ile sar (ele geçirilen host "
+             "üzerinden SOCKS pivot ile iç ağ taraması). /etc/proxychains.conf gerekir.",
+    )
+    p.add_argument(
         "--no-clock-fix",
         dest="no_clock_fix",
         action="store_true",
@@ -886,13 +946,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--resume",
         action="store_true",
-        help="Aynı hedefin son raporundan kullanıcı/host/kimlik/domain bilgisini yükle (delta)",
+        help="Kontrol checkpoint'inden devam et; son rapordan kullanıcı/host/kimlik yükle",
     )
     p.add_argument(
         "--diff",
         metavar="JSON",
         help="Bu taramayı önceki bir JSON raporuyla kıyasla (yeni/çözülen bulgular)",
     )
+    p.add_argument("--context-label", help="Karşılaştırmada gösterilecek tarama kimliği etiketi")
+    p.add_argument("--context-role", choices=["anonymous", "standard", "auditor", "privileged", "custom"],
+                   help="Test bağlamının kullanıcı tarafından belirtilen rolü")
+    p.add_argument("--compare-reports", nargs="+", metavar="JSON",
+                   help="Aynı hedefin raporlarını kontrol/kimlik bazında karşılaştır; hedefsiz kullanım çevrimdışıdır")
+    p.add_argument("--acl-snapshot", metavar="JSON",
+                   help="Sıralı DACL + kimlik/grup snapshot'ından etkin AD haklarını hesapla")
     p.add_argument(
         "--html",
         action="store_true",
@@ -923,6 +990,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="KAPSAMLI tarama: tüm tespit modüllerini aç (ADCS + bloodyAD + BloodHound + "
              "MSSQL + WinRM). Kimlik verilirse kimlikli modüller de çalışır; aktif ağ "
              "saldırıları (spray/relay) yine ayrı bayrak + onay ister. --auto ile birleştir.")
+    auto.add_argument(
+        "--full-ports", action="store_true",
+        help="nmap'te önce hızlı tam-TCP (-p-) keşfi yap, sonra açık portlarda "
+             "NSE/servis taraması çalıştır (sabit AD port listesi dışındaki IIS/certsrv "
+             "gibi servisleri de kapsar). --full bunu otomatik açar.")
     auto.add_argument(
         "--auto", action="store_true",
         help="Otonom mod: enum -> kullanıcı çıkar -> spray -> Domain Admin yükseltme")
@@ -987,6 +1059,12 @@ def build_parser() -> argparse.ArgumentParser:
     active.add_argument("--listener-ip", help="Relay/listener IP")
     active.add_argument("--relay-targets", help="Relay hedef(ler)i (ör. ldaps://dc.ip)")
     active.add_argument("--adcs-ca-url", help="ESC8 için CA web enrollment URL'i")
+    active.add_argument("--shadow-target",
+                        help="Shadow Credentials uygulanacak hesap (sAMAccountName); "
+                             "boşsa BloodHound'dan AddKeyCredentialLink kenarı seçilir")
+    active.add_argument("--adcs-exploit", action="store_true",
+                        help="Savunmasız ADCS şablonu bulunursa (ESC1) otomatik sertifika "
+                             "isteyip PKINIT ile NT hash dene (aktif; --active-attacks onayı)")
     active.add_argument("--capture-seconds", type=int, default=120,
                         help="Aktif yakalama penceresi (sn, varsayılan 120)")
     active.add_argument("--reuse", action="store_true",
@@ -1055,6 +1133,70 @@ def _run_cleanup(args) -> int:
     return 0 if not fail else 1
 
 
+def _attach_analysis(args, report, *, include_current=True):
+    from .comparison import compare, read_report
+    from .permissions import load_snapshot
+
+    if args.acl_snapshot:
+        load_snapshot(args.acl_snapshot, report)
+    if args.compare_reports:
+        inputs = [(read_report(path), path) for path in args.compare_reports]
+        if any(str(data["target"]).strip().casefold() != report.target.strip().casefold()
+               for data, _ in inputs):
+            raise ValueError("Karşılaştırma hedefi mevcut raporla uyuşmuyor")
+        if include_current:
+            inputs.append((report.to_dict(), "Bu tarama"))
+        if len(inputs) < 2:
+            raise ValueError("Çevrimdışı karşılaştırma için en az iki rapor gerekli")
+        report.comparison = compare(inputs)
+
+
+def _validate_analysis_inputs(args):
+    from .comparison import compare, read_report
+    from .permissions import load_snapshot
+
+    if args.compare_reports:
+        inputs = [(read_report(path), path) for path in args.compare_reports]
+        if any(str(data["target"]).strip().casefold() != args.target.strip().casefold()
+               for data, _ in inputs):
+            raise ValueError("Karşılaştırılan raporların hedefi tarama hedefiyle uyuşmuyor")
+        compare(inputs)
+    if args.acl_snapshot:
+        load_snapshot(args.acl_snapshot, ScanReport(args.target))
+
+
+def _offline_analysis(args):
+    import hashlib
+    from pathlib import Path
+
+    from .comparison import read_report
+
+    try:
+        if args.compare_reports:
+            first = read_report(args.compare_reports[0])
+            target = first["target"]
+        else:
+            with open(args.acl_snapshot, encoding="utf-8-sig") as stream:
+                snapshot = json.load(stream)
+            target = snapshot.get("target") if isinstance(snapshot, dict) else None
+        if not isinstance(target, str) or not target:
+            raise ValueError("Değerlendirme girdisinde target gerekli")
+        report = ScanReport(target, outdir=args.outdir, scan_mode="offline_analysis")
+        _attach_analysis(args, report, include_current=False)
+        Path(args.outdir).mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(target.encode()).hexdigest()[:12]
+        from uuid import uuid4
+        base = Path(args.outdir) / f"adscan-analysis-{digest}-{datetime.now():%Y%m%d-%H%M%S}-{uuid4().hex[:6]}"
+        for suffix, writer in [(".json", reporting.write_json), (".md", reporting.write_markdown),
+                               (".html", reporting.write_html)]:
+            writer(report, str(base) + suffix)
+        print(f"Çevrimdışı analiz kaydedildi: {base}.html")
+        return 0
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"HATA: çevrimdışı değerlendirme: {exc}")
+        return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -1079,10 +1221,16 @@ def main(argv: list[str] | None = None) -> int:
             args.html = True  # kapsamlı taramada paylaşılabilir HTML de üret
 
     config.set_redact(args.redact)
+    config.TERMINAL_UI = args.terminal_ui
+    config.set_proxychains(getattr(args, "proxychains", False))
     config.set_debug(args.debug)
     config.set_retries(args.retries)
 
     print(reporting.banner(reporting._supports_color()))
+    if args.terminal_preview:
+        from .terminal_demo import preview
+        preview()
+        return 0
 
     if args.guide:
         guide.print_guide()
@@ -1094,6 +1242,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cleanup:
         return _run_cleanup(args)
+
+    if not args.target and (args.compare_reports or args.acl_snapshot):
+        return _offline_analysis(args)
 
     if not args.target:
         print("HATA: hedef belirtilmedi. Kullanım: python -m adscan <hedef>\n")
@@ -1109,6 +1260,11 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     # --- denetim (audit) kaydı: çalıştırılan her komut dosyaya yazılsın ---
+    try:
+        _validate_analysis_inputs(args)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"HATA: değerlendirme girdisi geçersiz: {exc}")
+        return 2
     if args.audit_log:
         config.set_audit_log(args.audit_log)
         config.audit(f"=== adscan başladı — hedef: {args.target} ===")
@@ -1227,16 +1383,38 @@ def main(argv: list[str] | None = None) -> int:
         listener_ip=args.listener_ip,
         relay_targets=args.relay_targets,
         adcs_ca_url=args.adcs_ca_url,
+        adcs_exploit=getattr(args, "adcs_exploit", False),
         capture_seconds=args.capture_seconds,
         reuse_targets=args.reuse_targets,
+        shadow_target=getattr(args, "shadow_target", None),
         outdir=args.outdir,
         use_kerberos=args.kerberos,
         full=args.full,
+        full_ports=args.full or getattr(args, "full_ports", False),
     )
 
     report = ScanReport(target=args.target, outdir=args.outdir)
+    from uuid import uuid4
+    principal = ((ctx.domain + "\\" if ctx.domain else "") + ctx.username) if ctx.has_auth else "Anonymous"
+    report.execution_context = {
+        "id": str(uuid4()), "label": args.context_label or principal,
+        "principal": principal, "domain": ctx.domain or "",
+        "role": args.context_role or ("custom" if ctx.has_auth else "anonymous"),
+        "auth_type": "kerberos" if ctx.use_kerberos else "hash" if ctx.nthash else
+                     "password" if ctx.has_auth else "anonymous",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "requested_modules": [m.name for m in modules] + [m.name for m in selection_skips]}
+    if not args.dry_run:
+        from .checkpoint import Checkpoint
+        try:
+            ctx.checkpoint = Checkpoint(args.outdir, args.target, resume=args.resume)
+            report.checkpoint = ctx.checkpoint
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(f"[!] Checkpoint okunamadı/yazılamadı: {exc}")
+            return 2
     for mod in selection_skips:
-        report.record_coverage(mod.name, "skipped", "--quiet filtresi")
+        from .assessment import record_skipped
+        record_skipped(report, mod.name, "--quiet filtresi")
     modules = plan_modules(modules, ctx, report)
 
     # Bu çalışmanın temizlik kuyruğu taze başlasın (manifest yalnızca bu koşuyu kapsar)
@@ -1261,7 +1439,7 @@ def main(argv: list[str] | None = None) -> int:
             if report.credentials and not ctx.found_credentials:
                 ctx.found_credentials = list(report.credentials)
         else:
-            print("  [resume] önceki rapor bulunamadı — sıfırdan.")
+            print("  [resume] önceki rapor yok; mevcut kontrol checkpoint'leri kullanılacak.")
 
     # --- modülleri çalıştır (paralel) ---
     # Modüller I/O-bound (harici subprocess beklenir) olduğundan thread havuzu
@@ -1305,6 +1483,15 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- korelasyon: tiering ihlali (DA, DC-olmayan host'ta aktif) ---
     correlate.correlate_tiering(report)
+    # --- korelasyon: LDAP gizleme (SAMR >> LDAP -> confidential/ACL) ---
+    correlate.correlate_ldap_confidential(report)
+    # --- korelasyon: Kerberos saat-kayması kaldı mı? ---
+    correlate.correlate_clock_skew(report)
+
+    # --- ADCS ESC1 otomatik istismarı (aktif; --adcs-exploit + --active-attacks) ---
+    if getattr(args, "adcs_exploit", False) and args.active_attacks:
+        from .modules import certipy_scan as _cp
+        _cp.exploit_esc1(ctx, report)
 
     # --- AUTOPILOT: enum -> kullanıcı çıkar -> spray -> Domain Admin yükseltme ---
     if args.auto:
@@ -1350,6 +1537,11 @@ def main(argv: list[str] | None = None) -> int:
         aclgraph.analyze(ctx, report, ui=None, exploit=False)
 
     # --- raporlama ---
+    try:
+        _attach_analysis(args, report)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"HATA: değerlendirme girdisi geçersiz: {exc}")
+        return 2
     # Ayrıntılar tarama sırasında zaten akıtıldı; burada KOMPAKT özet veriyoruz.
     os.makedirs(args.outdir, exist_ok=True)
     mitre.annotate(report)  # bulgulara MITRE ATT&CK teknik id'leri ekle
@@ -1408,7 +1600,7 @@ def main(argv: list[str] | None = None) -> int:
               f"    Geri almak için: python -m adscan --cleanup {cleanup_path}")
 
     # Aynı hedefin eski raporlarını temizle (yalnızca en günceli kalsın)
-    if not args.keep_old_reports:
+    if not args.keep_old_reports and not args.context_label and not args.context_role and not args.compare_reports:
         pruned = _prune_old_reports(args.outdir, safe_target, base)
         if pruned:
             print(f"  (aynı hedefin {len(pruned)} eski raporu silindi — "

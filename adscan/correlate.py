@@ -25,6 +25,72 @@ def _is_dc_host(host: str, report: ScanReport) -> bool:
     return bool(tgt) and h == tgt
 
 
+def correlate_clock_skew(report: ScanReport) -> Finding | None:
+    """Herhangi bir modülün çıktısında Kerberos saat-kayması hatası kaldıysa
+    (faketime uygulanamayan araç, ör. bloodhound-python) net bir uyarı bırakır.
+
+    krbtime alt süreçleri libfaketime ile senkronlamaya çalışır; yoksa Kerberos
+    akışları (kerberoast/certipy/PKINIT) sessizce NTLM'e düşer ya da patlar.
+    """
+    import re as _re
+    blob = "\n".join(report.raw_outputs.values())
+    if not _re.search(r"KRB_AP_ERR_SKEW|Clock skew too great|skew too great",
+                      blob, _re.IGNORECASE):
+        return None
+    finding = Finding(
+        title="Kerberos saat-kayması tespit edildi — bazı araçlar NTLM'e düştü/başarısız oldu",
+        severity=Severity.INFO, target=report.target, source="correlate",
+        control_id="kerberos.clock-skew",
+        reference="KRB_AP_ERR_SKEW",
+        description="En az bir araç KDC ile >5 dk saat farkı yüzünden Kerberos bileti "
+                    "alamadı. Kerberoast/AS-REP/certipy (PKINIT) ve -k akışları eksik "
+                    "veya güvenilmez çalışmış olabilir.",
+        evidence="KRB_AP_ERR_SKEW / Clock skew too great (çıktıda görüldü)",
+        remediation="Saati DC'ye senkronla: 'sudo ntpdate <DC>' veya 'sudo rdate -n <DC>'; "
+                    "ya da adscan alt süreç senkronu için 'sudo apt install -y libfaketime' "
+                    "(--no-clock-fix verilmediğinden emin ol).",
+        poc=f"nxc smb {report.target}   # DC saatini gösterir; farkı ölç",
+        escalation="Saat düzeltildikten sonra kerberoast/certipy adımlarını tekrar çalıştır.")
+    report.add(finding)
+    return finding
+
+
+def correlate_ldap_confidential(report: ScanReport) -> Finding | None:
+    """SAMR (rid-brute) çok daha fazla kullanıcı görüyorsa LDAP okuması kısıtlı
+    demektir: hesaplar `confidential`/ACL ile gizlenmiş.
+
+    Bu, kimlikli bir bind'in bile birçok nesneyi okuyamadığını gösterir —
+    downstream enum (kerberoast/AS-REP/ACL) eksik kalır; o yüzden spray/roast
+    için SAMR listesi tercih edilmelidir. Pratik, gerçek bir sinyal.
+    """
+    samr, ldap = report.samr_user_count, report.ldap_user_count
+    if samr < 0 or ldap < 0:
+        return None
+    # Yalnız anlamlı fark: SAMR en az 3 kullanıcı ve LDAP'ın en az 2 katı kadar
+    # fazlasını görüyorsa (tek kullanıcılı erişim hesapları tipik).
+    if samr < 3 or samr < ldap * 2 or (samr - ldap) < 3:
+        return None
+    hidden = samr - ldap
+    finding = Finding(
+        title=f"LDAP okuması kısıtlı — {hidden} hesap gizli (SAMR {samr} vs LDAP {ldap})",
+        severity=Severity.MEDIUM, target=report.target, source="correlate",
+        control_id="ldap.confidential",
+        reference="LDAP read restriction / confidential attributes",
+        mitre="T1087.002",
+        description="SAMR (rid-brute) ile görülen hesap sayısı, kimlikli LDAP bind'in "
+                    "okuyabildiğinden belirgin fazla. Hesap nesneleri ACL/confidential "
+                    "ile gizlenmiş; mevcut kimliğin görünürlüğü dar.",
+        evidence=f"SAMR rid-brute: {samr} kullanıcı\nLDAP --users: {ldap} kullanıcı\n"
+                 f"Gizli (okunamayan): ~{hidden}",
+        remediation="Beklenen bir sertleştirmeyse not düş; değilse hangi principal'ın "
+                    "hangi OU'yu okuyabildiğini denetle.",
+        poc=f"nxc smb {report.target} -u <user> -p <pass> --rid-brute   # SAMR tam liste",
+        escalation="Spray/AS-REP/kerberoast için SAMR listesini kullan (LDAP enum eksik). "
+                   "Gizli kullanıcı adlarını kerbrute userenum ile doğrula.")
+    report.add(finding)
+    return finding
+
+
 def correlate_tiering(report: ScanReport) -> Finding | None:
     """DA hesabı DC-olmayan host'ta aktifse CRITICAL bir tiering-ihlali bulgusu üretir."""
     if not report.da_members or not report.sessions:

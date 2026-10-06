@@ -33,6 +33,8 @@ class ScanContext:
     outdir: str = "adscan-reports"  # loot/çıktı klasörü (kerberoast hash'leri vb.)
     use_kerberos: bool = False  # -k: Kerberos auth (ccache / FQDN gerekir)
     full: bool = False  # --full: kapsamlı/gürültülü ek modüller (spider_plus vb.) açık
+    full_ports: bool = False  # --full-ports / --full: nmap'te önce tam-TCP (-p-) keşfi yap
+    checkpoint: object | None = None
 
     # --- password spraying (opt-in, aktif) ---
     spray_userlist: str | None = None  # kullanıcı adı listesi (dosya)
@@ -49,11 +51,13 @@ class ScanContext:
     listener_ip: str | None = None  # relay/listener IP
     relay_targets: str | None = None  # relay hedef(ler)i (IP/CIDR/dosya)
     adcs_ca_url: str | None = None  # ESC8 için CA web enrollment URL'i
+    adcs_exploit: bool = False  # --adcs-exploit: ESC1 bulunursa otomatik cert+PKINIT dene
     capture_seconds: int = 120  # aktif yakalama penceresi (sn)
 
     # --- credential reuse / yanal hareket (opt-in, aktif; 2. aşama) ---
     reuse_targets: str | None = None  # kimliklerin deneneceği host'lar (IP/CIDR/dosya)
     found_credentials: list = field(default_factory=list)  # 1. aşamadan gelen kimlikler
+    shadow_target: str | None = None  # --shadow-target: shadow-cred uygulanacak hesap (boşsa BH'den seç)
 
     @property
     def has_auth(self) -> bool:
@@ -75,7 +79,8 @@ def plan_modules(modules, ctx, report):
         elif ctx.has_auth and ctx.password is None and mod.name == "windapsearch":
             reason = "windapsearch adaptörü parola gerektiriyor; hash aktarımı desteklenmiyor"
         if reason:
-            report.record_coverage(mod.name, "skipped", reason)
+            from .assessment import record_skipped
+            record_skipped(report, mod.name, reason)
         else:
             selected.append(mod)
     return selected
@@ -107,22 +112,33 @@ def all_modules() -> list[ScanModule]:
     import ettiği için döngüsel import'u önler.
     """
     from .modules import (
+        access_scan,
         bloodhound_scan,
         bloodyAD_scan,
         certipy_scan,
+        delegation_scan,
+        dns_scan,
+        gmsa_scan,
+        gpo_scan,
         mssql_scan,
         nmap_scan,
         nxc_scan,
         relay_scan,
         reuse_scan,
+        shadow_scan,
         smbmap_scan,
         spray_scan,
+        tickets_scan,
+        userenum_scan,
+        web_scan,
         windap_scan,
         winrm_scan,
     )
 
     return [
         nmap_scan.MODULE,
+        web_scan.MODULE,
+        dns_scan.MODULE,
         nxc_scan.SMB_MODULE,
         nxc_scan.LDAP_MODULE,
         nxc_scan.VULN_MODULE,
@@ -133,7 +149,14 @@ def all_modules() -> list[ScanModule]:
         bloodyAD_scan.MODULE,  # opt-in (yazılabilir ACL privesc, kimlik gerektirir)
         bloodhound_scan.MODULE,  # opt-in (saldırı grafiği toplama, kimlik gerektirir)
         mssql_scan.MODULE,  # opt-in (MSSQL privesc, kimlik gerektirir)
+        gmsa_scan.MODULE,  # opt-in (gMSA/LAPS parola okuma, kimlik gerektirir)
+        access_scan.MODULE,  # opt-in (kimlik -> protokol erişim matrisi)
+        delegation_scan.MODULE,  # opt-in (Kerberos delegasyon istismarı)
+        gpo_scan.MODULE,  # opt-in (yazılabilir GPO istismarı, BloodHound)
+        tickets_scan.MODULE,  # opt-in (overpass-the-hash / golden ticket)
         winrm_scan.MODULE,  # opt-in (WinRM yanal hareket, kimlik gerektirir)
+        shadow_scan.MODULE,  # opt-in + active (shadow credentials istismarı)
+        userenum_scan.MODULE,  # opt-in (kerbrute kullanıcı doğrulama; kimlik gerektirmez)
         spray_scan.MODULE,  # opt-in
         relay_scan.MODULE,  # opt-in + active
         reuse_scan.MODULE,  # opt-in + active (2. aşama)
@@ -144,6 +167,8 @@ def all_modules() -> list[ScanModule]:
 # --quiet yalnızca "low" modülleri çalıştırır (IDS/EDR tetiklemesini azaltmak için).
 _NOISE = {
     "nmap": "high",          # NSE zafiyet scriptleri + port taraması = gürültülü
+    "web": "low",            # birkaç HTTP GET; sessiz
+    "dns": "low",            # dig sorguları; sessiz (AXFR denemesi hariç)
     "nxc-smb": "low",
     "nxc-ldap": "low",
     "nxc-vulns": "high",     # zerologon/coerce_plus = aktif, DC'ye dokunur
@@ -154,7 +179,14 @@ _NOISE = {
     "bloodyad-enum": "low",
     "bloodhound": "medium",  # tüm grafiği çeker = hacimli LDAP trafiği
     "mssql": "low",
+    "gmsa": "low",
+    "access": "low",
+    "delegation": "low",
+    "gpo": "low",
+    "tickets": "low",
     "winrm": "low",
+    "shadow": "high",  # hedef hesabın msDS-KeyCredentialLink'ini değiştirir (aktif)
+    "userenum": "medium",  # kerbrute AS-REQ: kilitlemez ama KDC'de log üretir
     "spray": "high",
     "relay": "high",
     "reuse": "high",

