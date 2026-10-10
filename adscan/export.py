@@ -96,7 +96,7 @@ def write_loot_manifest(report: ScanReport, path: str) -> None:
     `config.REDACT` açıksa sırlar maskeli yazılır (güvenli paylaşım).
     """
     loot_dir = os.path.join(report.outdir, "loot")
-    loot_files: list[str] = []
+    loot_files: list[dict] = []
     if os.path.isdir(loot_dir):
         for root, _dirs, files in os.walk(loot_dir):
             for fn in sorted(files):
@@ -139,7 +139,7 @@ def write_attack_graph(report: ScanReport, path: str) -> None:
     edges: list[dict] = []
     seen_nodes = {"attacker"}
 
-    def add_node(nid: str, label: str, ntype: str, **extra) -> None:
+    def add_node(nid: str, label: str, ntype: str, **extra: object) -> None:
         if nid not in seen_nodes:
             nodes.append({"id": nid, "label": label, "type": ntype, **extra})
             seen_nodes.add(nid)
@@ -185,6 +185,104 @@ def write_attack_graph(report: ScanReport, path: str) -> None:
     }
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(graph, fh, ensure_ascii=False, indent=2)
+
+
+# Seviye -> SARIF result.level
+_SARIF_LEVEL = {
+    Severity.CRITICAL: "error",
+    Severity.HIGH: "error",
+    Severity.MEDIUM: "warning",
+    Severity.LOW: "note",
+    Severity.INFO: "note",
+}
+# Seviye -> GitHub Code Scanning "security-severity" (0.0–10.0)
+_SARIF_SECSEV = {
+    Severity.CRITICAL: "9.5",
+    Severity.HIGH: "8.0",
+    Severity.MEDIUM: "5.5",
+    Severity.LOW: "3.0",
+    Severity.INFO: "1.0",
+}
+
+
+def write_sarif(report: ScanReport, path: str) -> None:
+    """Bulguları SARIF 2.1.0 olarak yazar (GitHub Code Scanning / CI araçları).
+
+    Her `control_id` bir SARIF `rule`'una, her bulgu bir `result`'a eşlenir.
+    Seviye `error|warning|note`'a; GitHub için ayrıca `security-severity`
+    (0–10) özelliği yazılır. `partialFingerprints` ile bulgular koşular arası
+    kararlı biçimde eşleşir (gürültüsüz diff). Hedef, `logicalLocations` olarak
+    verilir; adscan dosya satırı üretmediğinden fiziksel konum kullanılmaz.
+    """
+    from . import __version__
+
+    rules: dict[str, dict] = {}
+    results: list[dict] = []
+    for f in report.sorted_findings():
+        rule_id = f.control_id or f.title
+        if rule_id not in rules:
+            rule: dict = {
+                "id": rule_id,
+                "name": "".join(w.capitalize() for w in f.source.split("-")) or "Finding",
+                "shortDescription": {"text": f.title},
+                "defaultConfiguration": {"level": _SARIF_LEVEL[f.severity]},
+                "properties": {
+                    "security-severity": _SARIF_SECSEV[f.severity],
+                    "tags": [t for t in ["active-directory", f.source,
+                                         *[m.strip() for m in f.mitre.split(",") if m.strip()]] if t],
+                },
+            }
+            if f.remediation:
+                rule["help"] = {"text": f.remediation}
+            if f.reference.startswith(("http://", "https://")):
+                rule["helpUri"] = f.reference
+            rules[rule_id] = rule
+
+        msg = f.description or f.title
+        if f.escalation:
+            msg += f"\n\nYükseltme: {f.escalation}"
+        result = {
+            "ruleId": rule_id,
+            "level": _SARIF_LEVEL[f.severity],
+            "message": {"text": msg},
+            "locations": [{
+                "logicalLocations": [{
+                    "fullyQualifiedName": f.target or report.target,
+                    "kind": "resource",
+                }],
+            }],
+            "partialFingerprints": {"adscanFingerprint/v1": f.fingerprint},
+            "properties": {
+                "security-severity": _SARIF_SECSEV[f.severity],
+                "verification": f.verification,
+                "mitre": f.mitre,
+                "source": f.source,
+            },
+        }
+        results.append(result)
+
+    sarif = {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {
+                "name": "adscan",
+                "informationUri": "https://github.com/",
+                "version": __version__,
+                "rules": list(rules.values()),
+            }},
+            "properties": {
+                "target": report.target,
+                "domain": report.domain,
+                "riskScore": report.risk_score(),
+                "riskLabel": report.risk_label(),
+                "domainAdmin": report.domain_admin,
+            },
+            "results": results,
+        }],
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(sarif, fh, ensure_ascii=False, indent=2)
 
 
 def write_csv(report: ScanReport, path: str) -> None:

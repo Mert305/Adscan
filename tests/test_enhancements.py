@@ -125,6 +125,28 @@ def test_csv_has_header_and_rows(tmp_path):
     assert any("Kerberoasting" in ln for ln in lines[1:])
 
 
+def test_sarif_valid_structure(tmp_path):
+    r = _demo_report(tmp_path)
+    p = str(tmp_path / "r.sarif")
+    export.write_sarif(r, p)
+    data = json.load(open(p, encoding="utf-8"))
+    assert data["version"] == "2.1.0"
+    run = data["runs"][0]
+    assert run["tool"]["driver"]["name"] == "adscan"
+    # her bulgu bir result; control_id başına bir rule
+    assert len(run["results"]) == 2
+    rule_ids = {rule["id"] for rule in run["tool"]["driver"]["rules"]}
+    assert {res["ruleId"] for res in run["results"]} == rule_ids
+    # HIGH -> error, MEDIUM -> warning
+    levels = sorted(res["level"] for res in run["results"])
+    assert levels == ["error", "warning"]
+    # GitHub security-severity ve kararlı parmak izi mevcut
+    for res in run["results"]:
+        assert res["properties"]["security-severity"]
+        assert res["partialFingerprints"]["adscanFingerprint/v1"]
+        assert res["locations"][0]["logicalLocations"][0]["fullyQualifiedName"]
+
+
 def test_attack_graph_nodes_and_edges(tmp_path):
     r = _demo_report(tmp_path)
     r.credentials[0].host = "10.0.0.5"

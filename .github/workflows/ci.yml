@@ -21,16 +21,30 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dev dependencies
-        run: python -m pip install --upgrade pip ruff mypy pytest
+        run: python -m pip install --upgrade pip ruff mypy pytest pytest-cov
 
       - name: Lint (ruff)
         run: ruff check adscan tests
 
-      - name: Type check (mypy, bilgi amaçlı)
+      - name: Type check — çekirdek modüller (zorunlu)
+        run: >-
+          mypy adscan/findings.py adscan/registry.py adscan/chain.py
+          adscan/comparison.py adscan/mitre.py adscan/export.py
+          --config-file pyproject.toml --follow-imports=silent
+
+      - name: Type check — tüm paket (bilgi amaçlı)
         run: mypy adscan || true
 
-      - name: Run tests
-        run: python -m pytest -q
+      - name: Run tests (+ coverage)
+        run: python -m pytest -q --cov=adscan --cov-report=term-missing --cov-report=xml --cov-fail-under=65
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: coverage.xml
+          if-no-files-found: ignore
 
       - name: Package import / entry point çözümlenebiliyor mu
         run: python -c "from adscan.cli import main; print('entry point OK')"

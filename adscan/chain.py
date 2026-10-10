@@ -93,7 +93,7 @@ _C = {"green": "\033[1;32m", "dim": "\033[2m", "bold": "\033[1m",
 
 
 def format_chain(report: ScanReport, *, color: bool = False) -> str:
-    def c(t, k):
+    def c(t: str, k: str) -> str:
         return f"{_C[k]}{t}{_C['reset']}" if color else t
 
     rows = evaluate(report)

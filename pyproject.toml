@@ -14,7 +14,7 @@ keywords = ["active-directory", "pentest", "netexec", "security", "ad"]
 dependencies = []  # yalnızca standart kütüphane; harici CLI araçları PATH'te olmalı
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "ruff>=0.5", "mypy>=1.8"]
+dev = ["pytest>=7.0", "pytest-cov>=4.1", "ruff>=0.5", "mypy>=1.8"]
 
 [project.scripts]
 adscan = "adscan.cli:main"
@@ -38,5 +38,30 @@ ignore = ["E501", "E402"]
 python_version = "3.10"
 ignore_missing_imports = true
 warn_unused_ignores = false
-# Kademeli tip kontrolü: şimdilik gevşek (CI'da bilgi amaçlı)
+# Kademeli tip kontrolü: genelde gevşek…
 check_untyped_defs = false
+
+# …ancak çekirdek veri/akış modülleri sıkı denetlenir (CI'da zorunlu).
+# Yeni modüller olgunlaştıkça bu listeye eklenir.
+[[tool.mypy.overrides]]
+module = [
+    "adscan.findings",
+    "adscan.registry",
+    "adscan.chain",
+    "adscan.comparison",
+    "adscan.mitre",
+    "adscan.export",
+]
+check_untyped_defs = true
+disallow_untyped_defs = true
+warn_return_any = true
+
+[tool.coverage.run]
+branch = true
+source = ["adscan"]
+omit = ["adscan/terminal_demo.py", "adscan/__main__.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_lines = ["pragma: no cover", "if __name__ == .__main__.:", "raise NotImplementedError"]

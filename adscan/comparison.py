@@ -5,11 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from typing import Any
 
 SUCCESS = {"completed", "findings"}
 
 
-def read_report(path):
+def read_report(path: str) -> dict[str, Any]:
     with open(path, encoding="utf-8-sig") as stream:
         data = json.load(stream)
     if not isinstance(data, dict) or not data.get("target") or not isinstance(data.get("coverage"), list):
@@ -17,14 +18,17 @@ def read_report(path):
     return data
 
 
-def compare(reports):
+def compare(reports: list[tuple[dict[str, Any], str]]) -> dict[str, Any]:
     """Inputs are (report dict, source label) pairs; no secrets are copied."""
     if not reports:
         return {"sessions": [], "controls": [], "findings": [], "warnings": []}
     targets = {str(data["target"]).strip().casefold() for data, _ in reports}
     if len(targets) != 1:
         raise ValueError("Karşılaştırılan raporların hedefi aynı olmalı")
-    sessions, matrix, findings, warnings = [], {}, {}, []
+    sessions: list[dict[str, Any]] = []
+    matrix: dict[Any, dict[str, Any]] = {}
+    findings: dict[str, dict[str, Any]] = {}
+    warnings: list[str] = []
     context_ids = set()
     for index, (data, source) in enumerate(reports):
         context = data.get("execution_context") or {}

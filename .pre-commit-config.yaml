@@ -15,3 +15,20 @@ repos:
       - id: end-of-file-fixer
       - id: check-yaml
       - id: check-added-large-files
+
+  # Çekirdek veri/akış modüllerinde sıkı tip kontrolü (CI ile aynı kapı).
+  - repo: local
+    hooks:
+      - id: mypy-core
+        name: mypy (çekirdek modüller, strict)
+        entry: mypy --config-file pyproject.toml --follow-imports=silent
+        language: system
+        pass_filenames: false
+        files: ^adscan/(findings|registry|chain|comparison|mitre|export)\.py$
+        args:
+          - adscan/findings.py
+          - adscan/registry.py
+          - adscan/chain.py
+          - adscan/comparison.py
+          - adscan/mitre.py
+          - adscan/export.py
