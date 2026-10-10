@@ -12,12 +12,19 @@ saldırı yolunu Domain Admin'e kadar izler.
 
 ```bash
 python -m adscan 10.10.10.5                         # kimliksiz enum + zafiyet taraması
+python -m adscan 10.10.10.0/24                       # SUBNET: host'ları + DC + domain OTOMATİK bul, taramayı DC üzerinden yürüt
 python -m adscan 10.10.10.5 -u user -p 'Pw!' -d corp.local
 python -m adscan 10.10.10.5 --full -u user -p 'Pw!' -d corp.local   # KAPSAMLI
 python -m adscan 10.10.10.5 --auto -u user -p 'Pw!' -d corp.local   # otonom -> DA
 python -m adscan --check                            # araçlar kurulu mu?
 ```
 
+- **Subnet keşfi** — hedef bir CIDR/aralık ise (ör. `10.10.10.0/24`) adscan önce
+  tüm subnette AD portlarını (88/389/445/636/3268…) tarar, **canlı host'ları**
+  çıkarır, **Domain Controller**'ı (88+389 imzası, GC=3268 önceliği) tespit eder ve
+  `nxc` null-session ile **domain adını + DC adını** otomatik bulur. Tarama bulunan
+  DC üzerinden yürür; diğer host'lar yanal-hareket/reuse hedefi olur. Kapatmak için
+  `--no-discover`. (Keşif aktif nmap kullanır; onay/kapsam kuralları aynen geçerlidir.)
 - **`--full`** — tek komutla **kimliğe göre kapsam**: uygun tespit modüllerini seçer
   (ADCS + bloodyAD + BloodHound + MSSQL + WinRM) ve paylaşılabilir HTML üretir.
   Kimlik yoksa kimliksiz akış çalışır; kimlik gerektiren modüller ve Kerberoasting,
@@ -53,6 +60,9 @@ python -m adscan --check                            # araçlar kurulu mu?
 - **Coercion primitifi**: **Print Spooler / PrinterBug (MS-RPRN)** ve **WebDAV
   (WebClient)** açık DC/host tespiti → relay/coerce zincirine (`--active-attacks`)
   besleme.
+- **LDAP relay yüzeyi**: **LDAP imzalama (signing)** ve **LDAPS channel binding
+  (EPA)** zorlanmıyorsa tespit (`ldap-signing`, nxc `ldap-checker`) → coercion'la
+  birlikte NTLM relay-to-LDAP (RBCD / shadow-cred / makine hesabı → DA).
 - **Zayıf Kerberos şifreleme**: **DES** etkin hesaplar ve **AES'siz RC4** hesapları
   (`msDS-SupportedEncryptionTypes` LDAP sorgusu) → hızlı offline kırma hedefleri.
 - **NTLMv1 / LM**: izinli `LmCompatibilityLevel` tespiti (`-M ntlmv1`) → yakalanan
@@ -97,6 +107,7 @@ Her tarama, paylaşılabilir ve makine-okunur çıktılar üretir:
 | `*.loot.json` | Loot manifesti: kimlikler + admin erişimleri + loot dosyaları |
 | `*.graph.json` | Saldırı grafiği: düğüm/kenar (saldırgan→kimlik→host→DA) |
 | `*.findings.csv` | Bulgular düz tablo (SIEM/takip) |
+| `*.sarif` | **SARIF 2.1.0** — GitHub Code Scanning / CI araçlarına yüklenebilir (seviye→error/warning/note, `security-severity`, kararlı parmak izi) |
 
 (Ek çıktıları kapatmak için `--no-extra-reports`.)
 

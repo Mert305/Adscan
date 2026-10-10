@@ -65,9 +65,11 @@ class ScanContext:
                                       or self.use_kerberos))
 
 
-def plan_modules(modules, ctx, report):
+def plan_modules(
+    modules: list[ScanModule], ctx: ScanContext, report: ScanReport
+) -> list[ScanModule]:
     """Filter unmet credential prerequisites before invoking any module."""
-    selected = []
+    selected: list[ScanModule] = []
     report.scan_mode = "authenticated" if ctx.has_auth else "unauthenticated"
     for mod in modules:
         reason = ""
@@ -118,8 +120,10 @@ def all_modules() -> list[ScanModule]:
         certipy_scan,
         delegation_scan,
         dns_scan,
+        escalate_scan,
         gmsa_scan,
         gpo_scan,
+        ldapsign_scan,
         mssql_scan,
         nmap_scan,
         nxc_scan,
@@ -131,6 +135,7 @@ def all_modules() -> list[ScanModule]:
         tickets_scan,
         userenum_scan,
         web_scan,
+        webshot_scan,
         windap_scan,
         winrm_scan,
     )
@@ -150,6 +155,7 @@ def all_modules() -> list[ScanModule]:
         bloodhound_scan.MODULE,  # opt-in (saldırı grafiği toplama, kimlik gerektirir)
         mssql_scan.MODULE,  # opt-in (MSSQL privesc, kimlik gerektirir)
         gmsa_scan.MODULE,  # opt-in (gMSA/LAPS parola okuma, kimlik gerektirir)
+        ldapsign_scan.MODULE,  # opt-in (LDAP signing/channel-binding = relay-to-LDAP riski)
         access_scan.MODULE,  # opt-in (kimlik -> protokol erişim matrisi)
         delegation_scan.MODULE,  # opt-in (Kerberos delegasyon istismarı)
         gpo_scan.MODULE,  # opt-in (yazılabilir GPO istismarı, BloodHound)
@@ -160,6 +166,8 @@ def all_modules() -> list[ScanModule]:
         spray_scan.MODULE,  # opt-in
         relay_scan.MODULE,  # opt-in + active
         reuse_scan.MODULE,  # opt-in + active (2. aşama)
+        escalate_scan.MODULE,  # opt-in + active (kimlik→DA otonom yükseltme zinciri)
+        webshot_scan.MODULE,  # opt-in (web yüzeyi ekran görüntüsü, headless tarayıcı)
     ]
 
 
@@ -180,6 +188,8 @@ _NOISE = {
     "bloodhound": "medium",  # tüm grafiği çeker = hacimli LDAP trafiği
     "mssql": "low",
     "gmsa": "low",
+    "ldap-signing": "low",  # salt-okuma LDAP bind + kontrol
+    "webshot": "low",  # yalnız HTTP GET + render
     "access": "low",
     "delegation": "low",
     "gpo": "low",
@@ -190,6 +200,7 @@ _NOISE = {
     "spray": "high",
     "relay": "high",
     "reuse": "high",
+    "escalate": "high",  # reuse+secretsdump+DCSync: aktif, DC'ye dokunur
 }
 
 

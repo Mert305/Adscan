@@ -622,6 +622,76 @@ def _esc(text: str) -> str:
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
+def _screenshots_html(report) -> str:
+    """Yakalanan web ekran görüntülerini (base64 PNG) bir galeri olarak gömer."""
+    shots = getattr(report, "screenshots", None) or {}
+    if not shots:
+        return ""
+    cards = []
+    for url, b64 in shots.items():
+        if not b64:
+            continue
+        cards.append(
+            f'<figure class="shotimg"><figcaption>{_esc(url)}</figcaption>'
+            f'<a href="data:image/png;base64,{b64}" target="_blank" rel="noopener">'
+            f'<img loading="lazy" alt="{_esc(url)}" '
+            f'src="data:image/png;base64,{b64}"></a></figure>')
+    if not cards:
+        return ""
+    return (f'<h2>Ekran Görüntüleri ({len(cards)})</h2>'
+            f'<div class="shot-gallery">{"".join(cards)}</div>')
+
+
+def _attack_path_svg(report) -> str:
+    """Saldırı yolunu (chain.evaluate) BloodHound tarzı dikey SVG graf olarak çizer.
+
+    Elde edilen adımlar yeşil/dolu, bekleyenler gri/kesik. Son DA düğümü vurgulanır.
+    Bağımsız inline SVG — ek bağımlılık yok, hem koyu hem açık temada okunur.
+    """
+    from . import chain as _chain
+    steps = _chain.evaluate(report)
+    if not steps:
+        return ""
+    node_h, gap, pad, width = 44, 26, 16, 680
+    rows = list(steps) + [("__da__", report.domain_admin)]
+    height = pad * 2 + len(rows) * node_h + (len(rows) - 1) * gap
+    cx = width // 2
+    parts = [f'<svg class="apath" viewBox="0 0 {width} {height}" '
+             f'role="img" aria-label="Saldırı yolu grafiği" '
+             f'xmlns="http://www.w3.org/2000/svg">']
+    for i, item in enumerate(rows):
+        y = pad + i * (node_h + gap)
+        is_da = item[0] == "__da__"
+        ok = item[1]
+        title = ("DOMAIN ADMIN" if is_da else item[0].title)
+        if is_da:
+            fill, stroke, tcol = ("#b00020", "#b00020", "#fff") if ok else \
+                ("rgba(176,0,32,.10)", "#b00020", "#b00020")
+        elif ok:
+            fill, stroke, tcol = "#1f7a3d", "#2ea04d", "#ffffff"
+        else:
+            fill, stroke, tcol = "rgba(127,127,127,.08)", "#8a8f98", "#8a8f98"
+        dash = '' if (ok or is_da) else ' stroke-dasharray="5 4"'
+        mark = "✓" if ok else ("★" if is_da else "○")
+        parts.append(
+            f'<rect x="{pad}" y="{y}" rx="9" width="{width - 2 * pad}" '
+            f'height="{node_h}" fill="{fill}" stroke="{stroke}"{dash} stroke-width="1.5"/>'
+            f'<text x="{pad + 16}" y="{y + node_h // 2 + 5}" fill="{tcol}" '
+            f'font-size="14" font-weight="600" '
+            f'font-family="-apple-system,Segoe UI,Roboto,sans-serif">'
+            f'{mark}&#160;&#160;{_esc(title)}</text>')
+        if i < len(rows) - 1:
+            ay = y + node_h
+            acol = "#2ea04d" if rows[i + 1][1] else "#8a8f98"
+            parts.append(
+                f'<line x1="{cx}" y1="{ay}" x2="{cx}" y2="{ay + gap}" '
+                f'stroke="{acol}" stroke-width="2"/>'
+                f'<polygon points="{cx - 5},{ay + gap - 6} {cx + 5},{ay + gap - 6} '
+                f'{cx},{ay + gap}" fill="{acol}"/>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
 def write_html(report: ScanReport, path: str) -> None:
     """Tek dosyalık, bağımsız (inline CSS) HTML rapor üretir."""
     from . import chain as chaining
@@ -652,8 +722,21 @@ def write_html(report: ScanReport, path: str) -> None:
             name = _mitre.TECH_NAMES.get(f.mitre, "")
             mitre_txt = (f'<div class="kv"><b>MITRE ATT&amp;CK:</b> '
                          f'<code>{_esc(f.mitre)}</code> {_esc(name)}</div>')
-        ev = (f'<div id="evidence-{anchor}"><b>Kanıt:</b>'
-              f'<pre>{_esc(f.evidence.strip())}</pre></div>' if f.evidence.strip() else "")
+        # Kanıt: ham araç çıktısını bir "terminal ekran görüntüsü" kartı gibi sun
+        # (pencere çubuğu + komut başlığı + koyu monospace gövde). Kurumsal rapor hissi.
+        if f.evidence.strip():
+            _cmd = getattr(f, "command", "") or ""
+            shot_title = (_cmd.strip().splitlines()[0] if _cmd.strip()
+                          else f"{f.source} — kanıt")
+            ev = (f'<div id="evidence-{anchor}" class="kv"><b>Kanıt (çıktı):</b>'
+                  f'<figure class="shot"><figcaption class="shot-bar">'
+                  f'<span class="dot r"></span><span class="dot y"></span>'
+                  f'<span class="dot g"></span>'
+                  f'<span class="shot-title">{_esc(shot_title)}</span></figcaption>'
+                  f'<pre class="shot-body">{_esc(f.evidence.strip())}</pre>'
+                  f'</figure></div>')
+        else:
+            ev = ""
         # Çalıştırılan komut: adscan'in bulguyu üretirken gerçekten koştuğu komut(lar)
         if not getattr(f, "command", ""):
             cmd_html = ""
@@ -785,6 +868,33 @@ def write_html(report: ScanReport, path: str) -> None:
   .chain {{ background:var(--card); border:1px solid var(--line); border-radius:10px;
     padding:12px; white-space:pre-wrap; font-family:ui-monospace,Menlo,Consolas,monospace;
     font-size:12.5px; }}
+  /* Kanıt = terminal ekran görüntüsü kartı */
+  .shot {{ margin:8px 0 2px; border-radius:9px; overflow:hidden; border:1px solid #11131a;
+    box-shadow:0 8px 24px rgba(0,0,0,.28); background:#0c0e13; }}
+  .shot-bar {{ display:flex; align-items:center; gap:7px; padding:8px 12px;
+    background:linear-gradient(#20242e,#171b23); border-bottom:1px solid #000; }}
+  .shot-bar .dot {{ width:11px; height:11px; border-radius:50%; flex:none; }}
+  .shot-bar .dot.r {{ background:#ff5f57; }} .shot-bar .dot.y {{ background:#febc2e; }}
+  .shot-bar .dot.g {{ background:#28c840; }}
+  .shot-title {{ margin-left:6px; color:#aeb6c2; font-size:12px;
+    font-family:ui-monospace,Menlo,Consolas,monospace; white-space:nowrap;
+    overflow:hidden; text-overflow:ellipsis; }}
+  .shot-body {{ margin:0; background:#0c0e13; color:#d5f5c8; padding:12px 14px;
+    font-size:12px; line-height:1.5; white-space:pre-wrap; word-break:break-word;
+    max-height:360px; overflow:auto; border-radius:0; }}
+  /* Saldırı yolu grafiği */
+  .apath-wrap {{ background:var(--card); border:1px solid var(--line); border-radius:10px;
+    padding:14px; margin:10px 0; overflow:auto; }}
+  .apath {{ display:block; width:100%; max-width:680px; height:auto; margin:0 auto; }}
+  /* Web ekran görüntüsü galerisi */
+  .shot-gallery {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr));
+    gap:12px; margin:10px 0; }}
+  .shotimg {{ margin:0; background:var(--card); border:1px solid var(--line);
+    border-radius:10px; overflow:hidden; }}
+  .shotimg figcaption {{ padding:7px 10px; font-size:12px; color:var(--muted);
+    font-family:ui-monospace,Menlo,Consolas,monospace; white-space:nowrap;
+    overflow:hidden; text-overflow:ellipsis; border-bottom:1px solid var(--line); }}
+  .shotimg img {{ display:block; width:100%; height:auto; }}
 </style></head>
 <body><div class="wrap report-shell">
   <header class="app-header"><div class="brand-mark"><span class="brand-icon">A</span>ADSCAN
@@ -820,7 +930,9 @@ def write_html(report: ScanReport, path: str) -> None:
   <h2>Öncelikli Düzeltmeler</h2>
   <p>Önem derecesine göre sıralanır. Doğrulama durumu, kanıtın niteliğini gösterir.</p>
   <ol class="priority">{priority or '<li>Önceliklendirilecek bulgu kaydı yok. Kontrol kapsamını inceleyin.</li>'}</ol>
+  {_screenshots_html(report)}
   <h2>Saldırı Yolu</h2>
+  <div class="apath-wrap">{_attack_path_svg(report)}</div>
   <details id="chain-details"><summary>Yol analizini ve teknik adımları incele</summary>
   <div class="chain">{chain_txt}</div></details>
   {errors_html}

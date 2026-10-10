@@ -14,6 +14,21 @@ from ..util import grep as _grep
 
 WINDAP_CANDIDATES = ["windapsearch", "windapsearch.py"]
 
+# GERÇEK bir LDAP sonuç satırı: bir nesnenin ilk sütunda yazılmış attribute'u.
+# windapsearch'in ilerleme banner'larını ('[+] Using DN: CN=...', '[+]\tFound: DC=...',
+# '[+] ...success! Binded as:') AYIKLAR — bunlar 'DN:' / 'CN=' içerse de veri DEĞİLDİR.
+# Anonim bind açık ama arama reddediliyorsa ('successful bind must be completed') hiç
+# attribute dönmez; bu regex o durumda eşleşmeyerek yanlış pozitifi önler.
+_RESULT_RX = re.compile(
+    r"^[ \t]*(?:sAMAccountName|distinguishedName|userPrincipalName):[ \t]*\S",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _has_results(text: str) -> bool:
+    """windapsearch çıktısında gerçekten enumere edilmiş nesne var mı?"""
+    return bool(_RESULT_RX.search(text))
+
 
 def tool() -> ToolStatus:
     return resolve_tool(WINDAP_CANDIDATES)
@@ -60,16 +75,30 @@ def parse(results: list[CommandResult], report: ScanReport) -> None:
     report.raw_outputs["windapsearch"] = "\n\n".join(r.combined for r in results)
     combined = strip_dryrun("\n\n".join(r.combined for r in results))
 
-    first = results[0] if results else None
-    if first and not first.ok:
-        report.add_error(f"windapsearch: {first.error or 'çalıştırılamadı'}")
-        return
-
     target = report.target
+
+    # windapsearch bağlantı/bind hatasında da sıfırdan farklı kod döndürür ama
+    # yararlı bir mesajı stdout'a '[!] ...' satırı olarak yazar. Bir tek run'ın
+    # (ör. ilk sıradaki --da) başarısız olması TÜM enumerasyonu geçersiz kılmaz;
+    # yalnızca HİÇBİR run veri üretmediyse ve hepsi hatalıysa sert hata ver.
+    got_any_data = _has_results(combined)
+    all_failed = bool(results) and all(not r.ok for r in results)
+    if all_failed and not got_any_data:
+        # Aracın kendi hata nedenini (bağlantı yok / anonim bind reddedildi /
+        # kimlik hatası) çıkar; yoksa ilk run'ın hata alanına düş.
+        reason = ""
+        err_line = _grep(combined, r"^\s*\[!\].*", context=0)
+        if err_line:
+            reason = err_line.splitlines()[0].strip()
+        if not reason:
+            first = results[0]
+            reason = first.error or "çalıştırılamadı (çıktı üretilmedi)"
+        report.add_error(f"windapsearch: {reason}")
+        return
 
     # Anonim bind ile veri çekilebildi mi? (kimlik verilmeden sonuç geldiyse)
     used_creds = any("-u" in r.argv for r in results)
-    got_data = bool(re.search(r"dn:|cn:|sAMAccountName", combined, re.IGNORECASE))
+    got_data = _has_results(combined)
     if not used_creds and got_data:
         report.add(
             Finding(
@@ -78,7 +107,7 @@ def parse(results: list[CommandResult], report: ScanReport) -> None:
                 target=target,
                 source="windapsearch",
                 description="Kimlik bilgisi olmadan LDAP'tan kullanıcı/grup bilgisi okunabildi.",
-                evidence=_grep(combined, r"sAMAccountName|cn:", context=0),
+                evidence=_grep(combined, r"^[ \t]*sAMAccountName:", context=0),
                 remediation="Anonim LDAP bind'i kapatın (dsHeuristics).",
                 reference="Anonymous LDAP bind",
                 poc=f"windapsearch --dc-ip {target} -U   # kimliksiz kullanıcı listesi",

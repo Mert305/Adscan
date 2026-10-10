@@ -781,10 +781,15 @@ def parse_smb(results: list[CommandResult], report: ScanReport) -> None:
             )
         )
 
-    # Null/anonim oturum: boş kullanıcı adıyla [+] (ör. 'domain\:')  -> FP'siz
+    # Null/anonim oturum. İki sinyal:
+    #  1) Modern NetExec her host-info satırında null bind'i kanıtladığında
+    #     '(Null Auth:True)' basar (kimlik verilse de probe edilir) — en güvenilir.
+    #  2) Eski CME/plaintext başarı satırı: boş kullanıcıyla '[+] domain\:'.
+    null_marker = _grep(combined, r".*Null Auth:\s*True.*", context=0)
     null_line = _grep(combined, r"\[\+\]\s+\S+\\:\s*($|\()", context=0) \
         or _grep(combined, r"\[\+\]\s+\S+\\:", context=0)
-    if null_line and not pwned_lines:
+    null_evidence = null_marker or null_line
+    if null_evidence and not pwned_lines:
         report.add(
             Finding(
                 title="Null/anonim SMB oturumu mümkün — nxc",
@@ -792,7 +797,7 @@ def parse_smb(results: list[CommandResult], report: ScanReport) -> None:
                 target=target,
                 source="nxc-smb",
                 description="Kimlik bilgisi olmadan (boş kullanıcı/parola) SMB oturumu açıldı.",
-                evidence=null_line,
+                evidence=null_evidence,
                 remediation="RestrictAnonymous/RestrictNullSessAccess ile null session'ı kapatın.",
                 reference="Null Session",
                 poc=f"nxc smb {target} -u '' -p ''",

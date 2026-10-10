@@ -339,6 +339,10 @@ def _run_once(
             check=False,
             cwd=cwd,
             env=child_env,
+            # Orkestratör etkileşimsizdir: stdin'i kapat ki parola soran bir araç
+            # (ör. windapsearch -u verilip -p verilmezse) terminalden girdi
+            # bekleyip askıda KALMASIN; getpass EOF alıp hızlıca hata versin.
+            stdin=subprocess.DEVNULL,
         )
         return CommandResult(
             tool=tool,

@@ -139,6 +139,7 @@ class ScanReport:
     outdir: str = "adscan-reports"  # loot/çıktı klasörü (bloodhound vb. konumları için)
     da_members: list[str] = field(default_factory=list)  # Domain Admins üye adları (korelasyon)
     sessions: dict = field(default_factory=dict)  # host -> [oturum açmış kullanıcılar] (korelasyon)
+    screenshots: dict = field(default_factory=dict)  # url -> base64 PNG (web ekran görüntüleri)
     coverage: list[dict] = field(default_factory=list)
     scan_mode: str = "unspecified"
     execution_context: dict = field(default_factory=dict)

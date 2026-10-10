@@ -16,7 +16,8 @@ def test_all_modules_names():
     assert names == {"nmap", "web", "dns", "nxc-smb", "nxc-ldap", "nxc-vulns",
                      "smbmap", "windapsearch", "certipy", "bloodyad", "bloodyad-enum",
                      "bloodhound", "mssql", "gmsa", "access", "delegation", "gpo",
-                     "tickets", "winrm", "shadow", "userenum", "spray", "relay", "reuse"}
+                     "tickets", "winrm", "shadow", "userenum", "spray", "relay", "reuse",
+                     "escalate", "ldap-signing", "webshot"}
 
 
 def test_select_none_returns_only_passive():

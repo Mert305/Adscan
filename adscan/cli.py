@@ -235,6 +235,150 @@ def _run_autopilot(args, ctx, report, password) -> None:
         ui.stop()
 
 
+def _run_brain_autopilot(args, ctx, report, password) -> None:
+    """LLM-güdümlü otonom mod: her turda Ollama bir sonraki modülü seçer.
+
+    Sabit 4-fazlı --auto yerine, mevcut bulgu durumuna bakıp registry
+    whitelist'inden modül seçtiren bir ajan döngüsü. Model yalnızca SEÇER;
+    gerçek komutu runner kurar (bkz. brain.py güvenlik ilkesi). Aktif modüller
+    yalnızca --brain-active ile aday olur ve yine kendi --launch kapısına tabidir.
+    """
+    from . import brain as brain_mod
+
+    # Kimliği havuza + domain'i bağlama kat (autopilot ile aynı başlangıç)
+    if args.username and (password or args.nthash):
+        report.add_credential(Credential(
+            username=args.username, secret=args.nthash or password,
+            kind="nthash" if args.nthash else "password",
+            domain=args.domain or report.domain or "", source="cli"))
+    if report.domain and not ctx.domain:
+        ctx.domain = report.domain
+
+    brain = brain_mod.OllamaBrain(
+        url=args.ollama_url, model=args.ollama_model, timeout=args.ollama_timeout,
+        keep_alive=getattr(args, "ollama_keep_alive", "30m"),
+        quiet=getattr(args, "quiet", False))
+    if getattr(args, "brain_bare_prompt", False):
+        brain.system_prompt = None  # özel modelin gömülü SYSTEM'i devreye girsin
+    trace_path = (getattr(args, "brain_trace", None)
+                  or os.path.join(args.outdir, "brain-trace.jsonl"))
+
+    ui = live_ui.Live(total=args.brain_max_steps).start()
+    progress.set_sink(_make_sink(ui))
+    try:
+        if not args.dry_run and not brain.available():
+            ui.log(_phase(f"BEYİN — Ollama erişilemiyor ({brain.url}); "
+                          "deterministik zincire düşülecek", ui.color))
+        elif not args.dry_run:
+            # Modeli döngüden ÖNCE belleğe yükle: tur-içi kararlar soğuk-yükleme
+            # gecikmesi yaşamasın (keep_alive ile sıcak kalır).
+            if brain.warmup():
+                ui.log(_phase(f"BEYİN — model sıcak ({brain.model}, "
+                              f"keep_alive={brain.keep_alive})", ui.color))
+        # 0) Ucuz keşif: beyne zengin başlangıç durumu ver
+        harvest.harvest(report)
+        _push_stats(ui, report)
+
+        # escalate yeniden-seçim izi: en son escalate çalıştığındaki gizli-kimlik
+        # sayısı. Yeni kimlik kazanılırsa escalate history'de olsa da tekrar aday olur.
+        escalate_cred_mark = -1
+
+        done = False
+        for step in range(1, args.brain_max_steps + 1):
+            exclude = set(brain.history)
+            cur_secret = sum(1 for c in report.credentials
+                             if getattr(c, "secret", None))
+            if "escalate" in exclude and cur_secret > escalate_cred_mark:
+                exclude.discard("escalate")  # yeni kimlik -> yeni yükseltme turu
+            candidates = brain_mod.runnable_candidates(
+                ctx, report, allow_active=args.brain_active,
+                exclude=exclude)
+            decision = brain.decide(report, ctx, candidates)
+            tag = "ollama" if decision.source == "ollama" else "yedek"
+            ui.log(_phase(f"BEYİN {step}/{args.brain_max_steps} [{tag}] — "
+                          f"{decision.rationale}", ui.color))
+            if decision.done or not decision.next_module:
+                brain_mod.append_trace(trace_path, {
+                    "step": step, "target": report.target, "model": brain.model,
+                    "source": decision.source, "state": brain.last_snapshot,
+                    "decision": {"next_module": None, "rationale": decision.rationale,
+                                 "confidence": decision.confidence, "done": True},
+                    "outcome": {"stopped": True, "domain_admin": report.domain_admin}})
+                done = True
+                break
+
+            mod = get_module(decision.next_module)
+            if mod.active:
+                ui.log("    ⚠ AKTİF modül (ağa müdahale; --launch planı/yürütmeyi belirler)")
+            ui.log(f"    → {mod.name} ({mod.label}) · güven={decision.confidence:.2f}")
+            brain.history.append(mod.name)
+            n0 = len(report.findings)
+            c0 = len(report.credentials)
+            run_err = ""
+            # Beyin belirli bir host seçtiyse (known_hosts whitelist'inden; decide()
+            # doğruladı) modülü o host'a yönelt; tur sonunda eski hedefe dön.
+            prev_target = ctx.target
+            if decision.target and decision.target != ctx.target:
+                ctx.target = decision.target
+                ui.log(f"    → hedef host: {ctx.target} (beyin seçimi)")
+            try:
+                if mod.name == "escalate":
+                    # Otonom kimlik→Domain Admin zinciri. run/parse sözleşmesine
+                    # sığmaz (ctx + report birlikte gerekir), bu yüzden burada
+                    # doğrudan yürütülür. --launch verilmediyse gerçek komut
+                    # ÇALIŞMAZ; yalnızca plan (dry-run) gösterilir (aktif modül kapısı).
+                    from . import escalate as escalate_mod
+                    prev_dry = ctx.dry_run
+                    if not ctx.launch:
+                        ctx.dry_run = True
+                        ui.log("    (escalate: --launch yok → PLAN modu; "
+                               "gerçek yükseltme için --brain-active --launch)")
+                    try:
+                        escalate_mod.run_to_da(ctx, report, ui=ui)
+                    finally:
+                        ctx.dry_run = prev_dry
+                    # Bu turdaki gizli-kimlik sayısını işaretle: yeni kimlik gelmezse
+                    # escalate tekrar seçilmez (sonsuz döngü yok); gelirse yeni tur.
+                    escalate_cred_mark = sum(1 for c in report.credentials
+                                             if getattr(c, "secret", None))
+                else:
+                    mod.parse(mod.run(ctx), report)
+            except Exception as exc:  # modül patlasa da döngü sürsün
+                run_err = str(exc)
+                report.add_error(f"{mod.name}: {exc}")
+                ui.log(f"    modül hata verdi: {exc}")
+            finally:
+                ctx.target = prev_target  # geçici hedef değişimini geri al
+            pocfill.fill(report)
+            for f in sorted(report.findings[n0:], key=lambda x: x.severity,
+                            reverse=True):
+                ui.log(reporting.render_finding(f, color=ui.color))
+            if len(report.findings) == n0:
+                ui.log("    (yeni bulgu yok)")
+            ui.advance()
+            _push_stats(ui, report)
+            # Yeni kimlik/kullanıcı sonraki tura beslensin
+            harvest.harvest(report)
+            ctx.found_credentials = list(report.credentials)
+            brain_mod.append_trace(trace_path, {
+                "step": step, "target": report.target, "model": brain.model,
+                "source": decision.source, "state": brain.last_snapshot,
+                "decision": {"next_module": mod.name, "rationale": decision.rationale,
+                             "confidence": decision.confidence, "done": False},
+                "outcome": {"new_findings": len(report.findings) - n0,
+                            "new_credentials": len(report.credentials) - c0,
+                            "error": run_err, "domain_admin": report.domain_admin}})
+            if report.domain_admin:
+                done = True
+                break
+        if not done:
+            ui.log(_phase(f"BEYİN — adım limiti ({args.brain_max_steps}) doldu",
+                          ui.color))
+    finally:
+        progress.set_sink(None)
+        ui.stop()
+
+
 def _run_escalation_phase(args, ctx, report, password) -> None:
     """--assume-breach: eldeki kimlikle (spray yok) doğrudan DA yükseltme fazı."""
     if args.username and (password or args.nthash):
@@ -804,8 +948,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     from . import __version__
     p.add_argument("--version", action="version", version=f"adscan {__version__}")
-    p.add_argument("--terminal-ui", choices=("compact", "detailed", "plain"), default="compact",
-                   help="Terminal görünümü: kısa kartlar, ayrıntılı veya animasyonsuz düz metin")
+    p.add_argument("--terminal-ui", choices=("compact", "detailed", "plain"), default="detailed",
+                   help="Terminal görünümü: ayrıntılı (VARSAYILAN; her bulguda gerçek PoC "
+                        "komutu + kanıt/çıktı + yükseltme yolu), kısa kartlar (compact) veya "
+                        "animasyonsuz düz metin (plain)")
     p.add_argument("--terminal-preview", action="store_true", help="Ağa bağlanmadan örnek terminal görünümü")
     p.add_argument("target", nargs="?", help="Hedef IP / CIDR / hostname (DC)")
     p.add_argument("-u", "--username", help="AD kullanıcı adı (opsiyonel)")
@@ -938,6 +1084,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="İzinli hedef kapsamı (satır başına IP/CIDR/host). Kapsam dışı hedef REDDEDİLİR.",
     )
     p.add_argument(
+        "--no-discover", dest="no_discover", action="store_true",
+        help="Subnet keşfini KAPAT. Varsayılanda hedef bir CIDR/aralık (ör. "
+             "10.0.0.0/24) ise önce canlı host'lar + DC + domain otomatik bulunur "
+             "ve tarama bulunan DC üzerinden yürür. Bu bayrak hedefi aynen kullanır.",
+    )
+    p.add_argument(
         "--profile",
         metavar="DOSYA",
         help="Engagement profili (JSON; pyyaml varsa YAML). Hedef/domain/kapsam/modül "
@@ -964,6 +1116,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--html",
         action="store_true",
         help="JSON+MD'ye ek olarak tek dosyalık HTML rapor da üret",
+    )
+    p.add_argument(
+        "--screenshots", dest="screenshots", action="store_true",
+        help="Web yüzeyinin (IIS/ADCS enrollment/login) headless tarayıcıyla ekran "
+             "görüntüsünü al ve HTML rapora göm. Headless chromium/chrome gerekir. "
+             "(--full bunu otomatik açar.)",
     )
     p.add_argument(
         "--no-extra-reports",
@@ -1020,6 +1178,59 @@ def build_parser() -> argparse.ArgumentParser:
     auto.add_argument(
         "--winrm", action="store_true",
         help="WinRM yanal hareket kontrolü ekle — kimlik gerektirir")
+
+    brain = p.add_argument_group("LLM beyin (Ollama) — otonom karar motoru")
+    brain.add_argument(
+        "--brain", action="store_true",
+        help="LLM-güdümlü otonom mod: her turda yerel Ollama modeli mevcut "
+             "bulgulara bakıp whitelist'ten BİR SONRAKİ modülü seçer. Model yalnızca "
+             "seçer; komutu runner kurar. Ollama yoksa deterministik zincire düşer.")
+    brain.add_argument(
+        "--ollama-url", dest="ollama_url", default=os.environ.get(
+            "OLLAMA_HOST", "http://localhost:11434"),
+        help="Ollama HTTP adresi (varsayılan: $OLLAMA_HOST ya da localhost:11434). "
+             "Ollama WSL'de, AdScan VM'deyse: http://<windows-host-ip>:11434")
+    brain.add_argument(
+        "--ollama-model", dest="ollama_model",
+        default=os.environ.get("ADSCAN_OLLAMA_MODEL", "adscan-brain"),
+        help="Kullanılacak Ollama modeli (varsayılan: adscan-brain; qwen3:8b tabanlı "
+             "özel beyin modeli — `ollama create` ile kurulur). Düz taban model de "
+             "verilebilir, ör. --ollama-model qwen3:8b")
+    brain.add_argument(
+        "--ollama-timeout", dest="ollama_timeout", type=int, default=120,
+        metavar="SN", help="Her LLM çağrısı için zaman aşımı (sn, varsayılan 120)")
+    brain.add_argument(
+        "--ollama-keep-alive", dest="ollama_keep_alive", default="30m",
+        metavar="SÜRE", help="Modeli bellekte sıcak tutma süresi (Ollama keep_alive; "
+             "ör. '30m', '2h', '-1' süresiz, '0' hemen boşalt). Döngü öncesi ön-ısıtma "
+             "ile birlikte tur-içi kararları hızlandırır (varsayılan: 30m).")
+    brain.add_argument(
+        "--brain-max-steps", dest="brain_max_steps", type=int, default=12,
+        metavar="N", help="Beyin döngüsü üst sınırı (varsayılan 12 tur)")
+    brain.add_argument(
+        "--brain-active", dest="brain_active", action="store_true",
+        help="Beynin AKTİF (ağa müdahale: spray/relay/poisoning) modülleri de "
+             "SEÇEBİLMESİNE izin ver. Aktif modüller yine kendi --launch kapısına "
+             "tabidir. Bu bayrak olmadan beyin yalnızca pasif/tespit modülü seçer.")
+    brain.add_argument(
+        "--brain-trace", dest="brain_trace", metavar="DOSYA", default=None,
+        help="Her beyin kararını (durum→seçim→sonuç) JSONL olarak yaz (denetim + "
+             "ileride fine-tune veri seti). Varsayılan: <outdir>/brain-trace.jsonl")
+    brain.add_argument(
+        "--brain-bare-prompt", dest="brain_bare_prompt", action="store_true",
+        help="İstekte system mesajı GÖNDERME; özel modele (ör. `ollama create "
+             "adscan-brain`) gömülü SYSTEM promptunu kullan. Uzmanlaştırılmış model "
+             "ile birlikte kullan.")
+    brain.add_argument(
+        "--brain-export-dataset", dest="brain_export_dataset", metavar="İZ",
+        default=None,
+        help="Beyin iz log(lar)ından (brain-trace.jsonl; joker * olabilir) fine-tune "
+             "veri seti üret ve çık. Yalnız başarılı (yeni bulgu/kimlik/DA üreten) "
+             "LLM kararları alınır. Çıktı için --dataset-out kullan.")
+    brain.add_argument(
+        "--dataset-out", dest="dataset_out", metavar="DOSYA", default="brain-dataset.jsonl",
+        help="--brain-export-dataset çıktısı (sohbet-formatı JSONL; varsayılan: "
+             "brain-dataset.jsonl)")
 
     cr = p.add_argument_group("çevrimdışı kırma (kerberoast / AS-REP)")
     cr.add_argument(
@@ -1243,6 +1454,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.cleanup:
         return _run_cleanup(args)
 
+    if getattr(args, "brain_export_dataset", None):
+        from . import finetune
+        try:
+            n, total = finetune.build_dataset(
+                [args.brain_export_dataset], args.dataset_out)
+        except OSError as exc:
+            print(f"HATA: veri seti yazılamadı: {exc}")
+            return 2
+        print(f"  [fine-tune] {n} örnek yazıldı ({total} iz satırından): "
+              f"{args.dataset_out}")
+        print("  Sonraki adım (adscan ÇALIŞTIRMAZ): qwen3:8b üzerine LoRA fine-tune "
+              "(unsloth/llama-factory) → 'ollama create adscan-brain-ft'.")
+        return 0
+
     if not args.target and (args.compare_reports or args.acl_snapshot):
         return _offline_analysis(args)
 
@@ -1282,6 +1507,27 @@ def main(argv: list[str] | None = None) -> int:
             print("Onay verilmedi — çıkılıyor.")
             return 1
 
+    # --- subnet keşfi: hedef CIDR/aralık ise host'ları + DC'yi + domain'i otomatik bul ---
+    # Tek IP yerine /24 verilirse burada canlı host'lar + DC tespit edilir; tarama
+    # pivotu (args.target) bulunan DC'ye çevrilir, diğer host'lar reuse hedefi olur.
+    _discovered = None
+    if not args.dry_run and not getattr(args, "no_discover", False):
+        from . import discover as _discover
+        if _discover.looks_like_range(args.target):
+            _discovered = _discover.discover(
+                args.target, timeout=args.timeout, domain_hint=args.domain)
+            if _discovered.dc_ip:
+                args.target = _discovered.dc_ip  # pivot = bulunan DC
+                if _discovered.domain and not args.domain:
+                    args.domain = _discovered.domain
+            elif _discovered.hosts:
+                # DC yok ama canlı host var: ilkini hedef al, kalanı reuse'a bırak
+                args.target = _discovered.hosts[0]
+                print(f"  [keşif] DC imzalı host yok; pivot: {args.target}")
+            else:
+                print("  [keşif] canlı host bulunamadı; girilen hedef aynen taranacak.")
+                _discovered = None
+
     # --- kimlik bilgisi çözümleme (güvenli) ---
     password = _resolve_password(args)
     if args.full and args.username and password is None and not args.nthash and not args.kerberos:
@@ -1319,6 +1565,9 @@ def main(argv: list[str] | None = None) -> int:
                 modules.append(get_module("mssql"))
             if args.winrm:
                 modules.append(get_module("winrm"))
+            # web ekran görüntüsü: --full ile ya da açıkça --screenshots
+            if args.full or getattr(args, "screenshots", False):
+                modules.append(get_module("webshot"))
     except (ValueError, KeyError) as exc:
         print(f"HATA: {exc}")
         return 2
@@ -1394,6 +1643,23 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     report = ScanReport(target=args.target, outdir=args.outdir)
+    # Subnet keşfinde bulunan host'ları/domain'i rapora + reuse hedeflerine bağla
+    if _discovered is not None:
+        for h in _discovered.hosts:
+            if h not in report.hosts:
+                report.hosts.append(h)
+        if _discovered.dc_name and not report.dc_name:
+            report.dc_name = _discovered.dc_name
+        if _discovered.domain and not report.domain:
+            report.domain = _discovered.domain
+        if not ctx.reuse_targets and _discovered.hosts:
+            ctx.reuse_targets = ",".join(_discovered.hosts)
+        report.raw_outputs["discover"] = (
+            f"hedef subnet: {_discovered.host_ports and 'tarandı' or ''}\n"
+            f"canlı host: {len(_discovered.hosts)}\n"
+            f"DC adayları: {', '.join(_discovered.dc_candidates) or '-'}\n"
+            f"seçilen DC: {_discovered.dc_ip or '-'} "
+            f"({_discovered.dc_name or '?'}) · domain: {_discovered.domain or '?'}")
     from uuid import uuid4
     principal = ((ctx.domain + "\\" if ctx.domain else "") + ctx.username) if ctx.has_auth else "Anonymous"
     report.execution_context = {
@@ -1483,6 +1749,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- korelasyon: tiering ihlali (DA, DC-olmayan host'ta aktif) ---
     correlate.correlate_tiering(report)
+    # --- korelasyon: coercion + imzalama zorlanmıyor -> uçtan uca relay-to-DA yolu ---
+    correlate.correlate_relay_path(report)
     # --- korelasyon: LDAP gizleme (SAMR >> LDAP -> confidential/ACL) ---
     correlate.correlate_ldap_confidential(report)
     # --- korelasyon: Kerberos saat-kayması kaldı mı? ---
@@ -1493,8 +1761,14 @@ def main(argv: list[str] | None = None) -> int:
         from .modules import certipy_scan as _cp
         _cp.exploit_esc1(ctx, report)
 
+    # --- BEYİN: LLM-güdümlü otonom mod (her turda Ollama modül seçer) ---
+    if getattr(args, "brain", False):
+        os.makedirs(args.outdir, exist_ok=True)
+        _run_brain_autopilot(args, ctx, report, password)
+        stage2 = []  # beyin zincirini kendisi yürüttü
+
     # --- AUTOPILOT: enum -> kullanıcı çıkar -> spray -> Domain Admin yükseltme ---
-    if args.auto:
+    elif args.auto:
         os.makedirs(args.outdir, exist_ok=True)
         _run_autopilot(args, ctx, report, password)
         stage2 = []  # auto zaten yükseltme yaptı
@@ -1575,8 +1849,9 @@ def main(argv: list[str] | None = None) -> int:
             export.write_loot_manifest(report, base + ".loot.json")
             export.write_attack_graph(report, base + ".graph.json")
             export.write_csv(report, base + ".findings.csv")
+            export.write_sarif(report, base + ".sarif")
             saved += [base + ".navigator.json", base + ".loot.json",
-                      base + ".graph.json", base + ".findings.csv"]
+                      base + ".graph.json", base + ".findings.csv", base + ".sarif"]
         except OSError as exc:
             print(f"  [export] ek çıktı yazılamadı: {exc}")
 

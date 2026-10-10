@@ -47,6 +47,25 @@ def test_nxc_smb_null_session(report):
     assert "-u '' -p ''" in f.poc
 
 
+def test_nxc_smb_null_session_modern_marker(report):
+    # Modern NetExec 1.5.x: '[+] domain\\:' başarı satırı basılmasa da
+    # host-info satırındaki '(Null Auth:True)' null oturumu kanıtlar.
+    out = ("SMB 10.10.10.5 445 DC01 [*] Windows Server 2019 (name:DC01) "
+           "(domain:corp.local) (signing:True) (SMBv1:False) (Null Auth:True)")
+    nxc_scan.parse_smb([cr(out)], report)
+    assert severity_of(report, "Null/anonim") == Severity.HIGH
+    f = next(f for f in report.findings if "Null" in f.title)
+    assert "Null Auth:True" in f.evidence
+
+
+def test_nxc_smb_null_auth_false_no_finding(report):
+    # '(Null Auth:False)' -> null oturum kapalı; bulgu ÜRETME (FP değil).
+    out = ("SMB 10.10.10.5 445 DC01 [*] Windows Server 2019 (name:DC01) "
+           "(domain:corp.local) (signing:True) (SMBv1:False) (Null Auth:False)")
+    nxc_scan.parse_smb([cr(out)], report)
+    assert not any("Null" in t for t in titles(report))
+
+
 def test_nxc_smb_no_false_positive_on_failed_login(report):
     # Sadece başarısız giriş ([-]) varsa oturum bulgusu ÜRETİLMEMELİ
     out = "SMB 10.10.10.5 445 DC [-] corp.local\\alice:wrong STATUS_LOGON_FAILURE"

@@ -20,12 +20,12 @@ from adscan.runner import CommandResult  # noqa: E402
 
 
 def cr(stdout: str, *, tool: str = "test", argv: list[str] | None = None,
-       error: str | None = None) -> CommandResult:
+       error: str | None = None, returncode: int = 0) -> CommandResult:
     """Testler için sahte komut sonucu."""
     return CommandResult(
         tool=tool,
         argv=argv or ["dummy"],
-        returncode=0,
+        returncode=returncode,
         stdout=stdout,
         stderr="",
         duration=0.0,
